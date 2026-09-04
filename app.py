@@ -1,9 +1,7 @@
-
 import io
 import os
 import re
 import json
-import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -11,10 +9,11 @@ import fitz  # PyMuPDF
 from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 
 st.set_page_config(
     page_title=APP_NAME,
@@ -50,14 +49,21 @@ st.info(
     "并把 Grid / Matching 题拆成 Microsoft Forms 较容易导入的独立题目。"
 )
 
-st.subheader("🔑 使用自己的 OpenAI API Key")
+st.subheader("🔑 使用自己的 Gemini API Key")
+st.markdown(
+    "第一次使用？可到 **Google AI Studio** 建立 Gemini API Key："
+    "[Get API Key](https://aistudio.google.com/app/apikey)"
+)
 api_key_input = st.text_input(
-    "OpenAI API Key",
+    "Gemini API Key",
     type="password",
-    placeholder="sk-...",
+    placeholder="AIza...",
     help="每次使用时输入。此 App 不会把你的 API Key 写入 GitHub、文件或数据库。"
 )
-st.caption("🔒 API Key 只用于本次页面会话的转换请求。关闭/刷新页面后请重新输入。ChatGPT Free/Plus 订阅与 API 额度分开。")
+st.caption(
+    "🔒 API Key 只用于本次页面会话的转换请求。关闭/刷新页面后请重新输入。"
+    "同一个有效的 Gemini API Key 可以重复使用，不需要每次重新建立。"
+)
 
 with st.expander("转换规则", expanded=False):
     st.markdown("""
@@ -93,6 +99,7 @@ with col2:
         index=0
     )
 
+
 def extract_pdf_text(data: bytes) -> str:
     doc = fitz.open(stream=data, filetype="pdf")
     chunks = []
@@ -101,10 +108,12 @@ def extract_pdf_text(data: bytes) -> str:
         chunks.append(f"\n===== PAGE {i+1} =====\n{txt}")
     return "\n".join(chunks)
 
+
 def extract_docx_text(data: bytes) -> str:
     tmp = io.BytesIO(data)
     doc = Document(tmp)
     return "\n".join(p.text for p in doc.paragraphs)
+
 
 def extract_answer_text(uploaded) -> str:
     if uploaded is None:
@@ -117,6 +126,7 @@ def extract_answer_text(uploaded) -> str:
         return extract_docx_text(data)
     return data.decode("utf-8", errors="ignore")
 
+
 def clean_json_text(s: str) -> str:
     s = s.strip()
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I)
@@ -126,6 +136,7 @@ def clean_json_text(s: str) -> str:
     if start >= 0 and end > start:
         s = s[start:end+1]
     return s
+
 
 def build_prompt(form_text: str, answer_text: str, quiz_mode: bool) -> str:
     answer_instruction = (
@@ -190,6 +201,7 @@ OPTIONAL ANSWER SOURCE
 ----------------
 {answer_text if answer_text else "(none)"}
 """
+
 
 def make_docx(structured: dict, quiz_mode: bool) -> bytes:
     doc = Document()
@@ -275,10 +287,12 @@ def make_docx(structured: dict, quiz_mode: bool) -> bytes:
     doc.save(bio)
     return bio.getvalue()
 
+
 def safe_filename(name: str) -> str:
     stem = Path(name).stem
     stem = re.sub(r'[\\/:*?"<>|]+', "_", stem)
     return f"{stem}_Microsoft_Forms_Import.docx"
+
 
 if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_container_width=True):
     if not pdf_file:
@@ -287,7 +301,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
 
     api_key = api_key_input.strip()
     if not api_key:
-        st.error("请先输入你自己的 OpenAI API Key。")
+        st.error("请先输入你自己的 Gemini API Key。")
         st.stop()
 
     try:
@@ -301,13 +315,17 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             quiz_mode = output_mode.startswith("Quiz")
             prompt = build_prompt(form_text, answer_text, quiz_mode)
 
-            st.write("AI 正在识别题目、选项与 Grid / Matching 结构")
-            client = OpenAI(api_key=api_key)
-            response = client.responses.create(
+            st.write("Gemini 正在识别题目、选项与 Grid / Matching 结构")
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
                 model=DEFAULT_MODEL,
-                input=prompt,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
             )
-            raw = response.output_text
+            raw = response.text or ""
             structured = json.loads(clean_json_text(raw))
 
             st.write("正在生成 Microsoft Forms Quick Import Word")
@@ -341,9 +359,15 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         )
 
     except json.JSONDecodeError:
-        st.error("AI 输出无法解析为结构化数据，请重试。若 PDF 很复杂，可分成较小部分转换。")
+        st.error("Gemini 输出无法解析为结构化数据，请重试。若 PDF 很复杂，可分成较小部分转换。")
     except Exception as e:
-        st.error(f"转换失败：{e}")
+        msg = str(e)
+        if "API_KEY_INVALID" in msg or "API key not valid" in msg or "INVALID_ARGUMENT" in msg:
+            st.error("Gemini API Key 无效或请求设置不正确。请到 Google AI Studio 检查 API Key 后再试。")
+        elif "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+            st.error("Gemini API 当前额度或速率限制已用完。请稍后再试，或检查 Google AI Studio / Google Cloud 的 API 配额。")
+        else:
+            st.error(f"转换失败：{e}")
 
 st.divider()
 st.markdown("""
@@ -351,6 +375,6 @@ st.markdown("""
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
 <strong>Privacy：</strong>
-上传内容会使用你本次输入的 OpenAI API Key 发送到 OpenAI API 进行转换；本 App 不会将 API Key 写入 GitHub、文件或数据库。请勿上传不应交由该服务处理的敏感资料。
+上传内容会使用你本次输入的 Gemini API Key 发送到 Google Gemini API 进行转换；本 App 不会将 API Key 写入 GitHub、文件或数据库。请勿上传不应交由该服务处理的敏感资料。
 </div>
 """, unsafe_allow_html=True)
