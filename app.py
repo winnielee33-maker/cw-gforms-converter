@@ -1,6 +1,7 @@
 import io
 import os
 import time
+import zipfile
 import re
 import json
 import hashlib
@@ -17,7 +18,7 @@ from google.genai import types
 APP_NAME = "Coach Winnie – Forms Converter"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
-APP_VERSION = "V3.3.2 Simple 3 Types + Image Extraction"
+APP_VERSION = "V3.3.3 Simple 3 Types + Image Extraction"
 
 st.set_page_config(
     page_title=APP_NAME,
