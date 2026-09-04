@@ -3,6 +3,7 @@ import os
 import re
 import json
 from pathlib import Path
+from collections import Counter
 
 import streamlit as st
 import fitz  # PyMuPDF
@@ -13,6 +14,7 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
+APP_VERSION = "V4 Compatibility Mode"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 
 st.set_page_config(
@@ -23,7 +25,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.block-container {max-width: 920px; padding-top: 2rem; padding-bottom: 3rem;}
+.block-container {max-width: 960px; padding-top: 2rem; padding-bottom: 3rem;}
 .hero {
   padding: 1.4rem 1.6rem;
   border-radius: 22px;
@@ -34,6 +36,12 @@ st.markdown("""
 .hero h1 {margin:0; font-size:2rem;}
 .hero p {margin:.45rem 0 0 0; opacity:.78;}
 .small {font-size:.9rem; opacity:.72;}
+.report-card {
+  border:1px solid rgba(120,120,120,.18);
+  border-radius:16px;
+  padding:1rem 1.1rem;
+  margin:.6rem 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,12 +49,13 @@ st.markdown(f"""
 <div class="hero">
   <h1>📝 {APP_NAME}</h1>
   <p>Google Forms PDF → Microsoft Forms Quick Import Word (.docx)</p>
+  <p><strong>{APP_VERSION}</strong></p>
 </div>
 """, unsafe_allow_html=True)
 
 st.info(
-    "上传从 Google Forms 打印/另存的 PDF。系统会保留题目顺序和选项，"
-    "并把 Grid / Matching 题拆成 Microsoft Forms 较容易导入的独立题目。"
+    "V4 会优先生成 Microsoft Forms Quick Import 较容易识别的题型。"
+    "Google Forms 的 Grid / Likert / Matching 会自动转换成兼容的独立 Choice 题。"
 )
 
 st.subheader("🔑 使用自己的 Gemini API Key")
@@ -65,16 +74,20 @@ st.caption(
     "同一个有效的 Gemini API Key 可以重复使用，不需要每次重新建立。"
 )
 
-with st.expander("转换规则", expanded=False):
+with st.expander("V4 Compatibility Mode 转换规则", expanded=False):
     st.markdown("""
-- 不添加、删除、总结或改写原题。
-- 不推测 PDF 中没有显示的正确答案。
-- 单选题保留为单选格式。
-- Checkbox / Multiple Answers 保留并标示为 **(Multiple Answers)**。
-- Short Answer / Paragraph 保留为开放题。
-- Multiple Choice Grid / Matching 会拆成多个独立选择题。
-- 图片 / 地图 / 图表题保留题干，并标示 **[IMAGE REQUIRED – Add original image manually after import]**。
-- 若上传答案文件，只使用答案文件明确显示的答案，不自行推测。
+- **Multiple choice / Dropdown** → Choice
+- **Checkboxes** → Choice（Multiple Answers）
+- **Short answer / Paragraph** → Text
+- **Linear scale** → Choice，并保留原来的刻度选项
+- **Multiple choice grid / Likert-style grid** → 每一行拆成一个独立 Choice，保留原列选项
+- **Checkbox grid** → 每一行拆成一个独立 Multiple Answers Choice
+- **Matching** → 尽量拆成独立 Choice；无法可靠判断时标记人工检查
+- **Date** → Text，并在转换报告中提示导入后可手动改成 Date
+- **Ranking** → Text/Choice，并在转换报告中提示导入后手动改成 Ranking
+- **Image / Map / Chart** → 保留题干，并提示导入后手动补图片
+- 不推测 PDF 中没有显示的正确答案
+- 不自行改写、总结或补充原题内容
 """)
 
 pdf_file = st.file_uploader("① 上传 Google Forms PDF", type=["pdf"])
@@ -147,29 +160,58 @@ def build_prompt(form_text: str, answer_text: str, quiz_mode: bool) -> str:
     )
 
     return f"""
-You are the conversion engine for "Coach Winnie – Forms Converter".
+You are the conversion engine for \"Coach Winnie – Forms Converter V4 Compatibility Mode\".
 
-TASK
-Convert a Google Forms print/PDF into a structure suitable for Microsoft Forms Quick Import Word (.docx).
+GOAL
+Convert a Google Forms print/PDF into a structure optimized for Microsoft Forms Quick Import Word (.docx).
+The import document should use only broadly compatible structures: choice, multiple-answer choice, and open text.
 
-NON-NEGOTIABLE RULES
+NON-NEGOTIABLE CONTENT RULES
 1. Use only information present in the supplied form text and optional answer source.
-2. Preserve original title, description, section order, question order, numbering, wording and options as faithfully as possible.
-3. Do not add, delete, summarize, rewrite, correct, explain or supplement question content.
+2. Preserve original title, description, section order, question order, wording and options as faithfully as possible.
+3. Do not add, delete, summarize, rewrite, correct, explain or supplement the user's question content.
 4. Do not infer answers. {answer_instruction}
-5. Preserve whether a question is single choice, multiple answers, short answer/paragraph, or grid/matching when identifiable.
-6. Convert each grid/matching row into a separate single-choice question using the original row label and original column choices.
-7. For any image/map/chart-dependent question, preserve the question text and add exactly:
-   [IMAGE REQUIRED – Add original image manually after import]
-8. If parsing is uncertain, preserve the visible text and set "review_required": true instead of guessing.
-9. Do not include Google footer text, timestamps, page URLs, "Mark only one oval", "Tick all that apply", or similar printing UI labels as question content.
+5. Do not include Google printing UI text such as timestamps, URLs, \"Mark only one oval\", \"Tick all that apply\", page footers, navigation labels, or form editing controls as question content.
+6. If parsing is uncertain, preserve visible text, choose the safest compatible output, and set review_required=true.
+
+V4 COMPATIBILITY MAPPING
+A. Google Multiple choice -> output_type=single_choice.
+B. Google Dropdown -> output_type=single_choice.
+C. Google Checkboxes -> output_type=multiple_answers.
+D. Google Short answer -> output_type=short_answer.
+E. Google Paragraph -> output_type=paragraph.
+F. Google Linear scale -> output_type=single_choice using the original visible scale values/options.
+G. Google Multiple choice grid / Likert-style grid:
+   - Create ONE independent single_choice question for EACH ROW.
+   - Use the original row label as the question text.
+   - If the grid has an overall title, preserve context by combining only original text in this form: "<grid title> — <row label>".
+   - Use the original column labels as options for every expanded row.
+   - original_type must be "multiple_choice_grid" and conversion_action must be "expanded_grid_row_to_choice".
+H. Google Checkbox grid:
+   - Create ONE independent multiple_answers question for EACH ROW.
+   - Use the original row label as the question text, optionally prefixed by the original grid title as above.
+   - Use original column labels as options.
+   - original_type="checkbox_grid" and conversion_action="expanded_grid_row_to_multiple_answers".
+I. Matching questions:
+   - If clearly expressed as rows + shared choices, expand each row to a single_choice question.
+   - Otherwise use short_answer and set review_required=true.
+J. Date:
+   - output_type=short_answer.
+   - original_type="date" and conversion_action="date_to_text_manual_change_recommended".
+K. Ranking:
+   - Preserve the visible prompt and items. Use short_answer unless a reliable choice representation is obvious.
+   - original_type="ranking" and conversion_action="ranking_manual_change_recommended".
+L. Image / map / chart dependent question:
+   - Preserve the question text.
+   - image_required=true.
+   - Do not hallucinate missing image content.
 
 QUIZ MODE
 quiz_mode = {str(quiz_mode).lower()}
 If quiz_mode is false, leave answers empty even if an answer source exists.
 If quiz_mode is true, include answer labels/text only when explicitly supported by the supplied answer source.
 
-RETURN STRICT JSON ONLY, with this schema:
+RETURN STRICT JSON ONLY with this schema:
 {{
   "title": "string",
   "description": "string",
@@ -181,7 +223,9 @@ RETURN STRICT JSON ONLY, with this schema:
         {{
           "number": "string",
           "question": "string",
-          "type": "single_choice|multiple_answers|short_answer|paragraph|image_question",
+          "output_type": "single_choice|multiple_answers|short_answer|paragraph",
+          "original_type": "multiple_choice|dropdown|checkboxes|short_answer|paragraph|linear_scale|multiple_choice_grid|checkbox_grid|matching|date|ranking|image_question|unknown",
+          "conversion_action": "kept|expanded_grid_row_to_choice|expanded_grid_row_to_multiple_answers|matching_expanded_to_choice|date_to_text_manual_change_recommended|ranking_manual_change_recommended|image_manual_insert_required|fallback_review_required",
           "options": ["string"],
           "answer": ["string"],
           "required": true,
@@ -235,10 +279,9 @@ def make_docx(structured: dict, quiz_mode: bool) -> bytes:
         for q in sec.get("questions", []):
             num = (q.get("number") or "").strip()
             text = (q.get("question") or "").strip()
-            qtype = q.get("type", "short_answer")
+            qtype = q.get("output_type", "short_answer")
             required = bool(q.get("required", False))
             image_required = bool(q.get("image_required", False))
-            review_required = bool(q.get("review_required", False))
 
             prefix = f"{num} " if num else ""
             suffix = ""
@@ -251,7 +294,7 @@ def make_docx(structured: dict, quiz_mode: bool) -> bytes:
             rr = p.add_run(f"{prefix}{text}{suffix}".strip())
             rr.bold = True
 
-            if image_required or qtype == "image_question":
+            if image_required:
                 doc.add_paragraph("[IMAGE REQUIRED – Add original image manually after import]")
 
             opts = q.get("options") or []
@@ -269,19 +312,7 @@ def make_docx(structured: dict, quiz_mode: bool) -> bytes:
                     ra = pa.add_run(label + ", ".join(map(str, ans)))
                     ra.bold = True
 
-            if review_required:
-                pr = doc.add_paragraph()
-                rr = pr.add_run("[REVIEW REQUIRED]")
-                rr.italic = True
-
             doc.add_paragraph("")
-
-    final = doc.add_paragraph()
-    r = final.add_run("Import note: ")
-    r.bold = True
-    final.add_run(
-        "After Quick Import, check Multiple Answers settings and manually add any required images, maps or charts."
-    )
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -291,7 +322,39 @@ def make_docx(structured: dict, quiz_mode: bool) -> bytes:
 def safe_filename(name: str) -> str:
     stem = Path(name).stem
     stem = re.sub(r'[\\/:*?"<>|]+', "_", stem)
-    return f"{stem}_Microsoft_Forms_Import.docx"
+    return f"{stem}_Microsoft_Forms_Import_V4.docx"
+
+
+def build_conversion_report(structured: dict):
+    questions = [
+        q
+        for sec in structured.get("sections", [])
+        for q in sec.get("questions", [])
+    ]
+    output_types = Counter(q.get("output_type", "unknown") for q in questions)
+    original_types = Counter(q.get("original_type", "unknown") for q in questions)
+    actions = Counter(q.get("conversion_action", "kept") for q in questions)
+
+    review_count = sum(1 for q in questions if q.get("review_required"))
+    image_count = sum(1 for q in questions if q.get("image_required"))
+    manual_date = actions.get("date_to_text_manual_change_recommended", 0)
+    manual_ranking = actions.get("ranking_manual_change_recommended", 0)
+    expanded_choice = actions.get("expanded_grid_row_to_choice", 0)
+    expanded_multi = actions.get("expanded_grid_row_to_multiple_answers", 0)
+    matching_expanded = actions.get("matching_expanded_to_choice", 0)
+
+    return {
+        "total": len(questions),
+        "output_types": output_types,
+        "original_types": original_types,
+        "review_count": review_count,
+        "image_count": image_count,
+        "manual_date": manual_date,
+        "manual_ranking": manual_ranking,
+        "expanded_choice": expanded_choice,
+        "expanded_multi": expanded_multi,
+        "matching_expanded": matching_expanded,
+    }
 
 
 if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_container_width=True):
@@ -315,7 +378,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             quiz_mode = output_mode.startswith("Quiz")
             prompt = build_prompt(form_text, answer_text, quiz_mode)
 
-            st.write("Gemini 正在识别题目、选项与 Grid / Matching 结构")
+            st.write("Gemini 正在识别题型并执行 Quick Import Compatibility 转换")
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model=DEFAULT_MODEL,
@@ -330,25 +393,40 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
 
             st.write("正在生成 Microsoft Forms Quick Import Word")
             docx_bytes = make_docx(structured, quiz_mode)
+            report = build_conversion_report(structured)
             status.update(label="转换完成 ✅", state="complete")
 
-        q_count = sum(len(s.get("questions", [])) for s in structured.get("sections", []))
-        review_count = sum(
-            1 for s in structured.get("sections", [])
-            for q in s.get("questions", [])
-            if q.get("review_required")
-        )
-        img_count = sum(
-            1 for s in structured.get("sections", [])
-            for q in s.get("questions", [])
-            if q.get("image_required") or q.get("type") == "image_question"
+        st.success(f"完成：共生成 {report['total']} 个 Microsoft Forms Quick Import 兼容题目。")
+
+        st.subheader("📊 转换报告")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Choice", report["output_types"].get("single_choice", 0))
+        c2.metric("Multiple Answers", report["output_types"].get("multiple_answers", 0))
+        c3.metric(
+            "Text",
+            report["output_types"].get("short_answer", 0) + report["output_types"].get("paragraph", 0),
         )
 
-        st.success(f"完成：共识别 {q_count} 个导入题目。")
-        if review_count or img_count:
-            st.warning(
-                f"需要人工检查：{review_count} 题；需要手动补图片/地图/图表：{img_count} 题。"
-            )
+        notes = []
+        if report["expanded_choice"]:
+            notes.append(f"Grid / Likert：已拆成 {report['expanded_choice']} 个独立 Choice 题。")
+        if report["expanded_multi"]:
+            notes.append(f"Checkbox Grid：已拆成 {report['expanded_multi']} 个 Multiple Answers 题。")
+        if report["matching_expanded"]:
+            notes.append(f"Matching：已拆成 {report['matching_expanded']} 个 Choice 题。")
+        if report["manual_date"]:
+            notes.append(f"Date：{report['manual_date']} 题先转为 Text；导入后可手动改成 Date。")
+        if report["manual_ranking"]:
+            notes.append(f"Ranking：{report['manual_ranking']} 题需要导入后手动调整为 Ranking。")
+        if report["image_count"]:
+            notes.append(f"图片 / 地图 / 图表：{report['image_count']} 题需要导入后手动补图。")
+        if report["review_count"]:
+            notes.append(f"人工检查：{report['review_count']} 题解析不确定，建议导入后核对。")
+
+        if notes:
+            st.warning("\n\n".join(notes))
+        else:
+            st.info("没有检测到需要额外人工转换的特殊题型。")
 
         st.download_button(
             "⬇️ Download Microsoft Forms Word",
@@ -356,6 +434,10 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             file_name=safe_filename(pdf_file.name),
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
+        )
+
+        st.caption(
+            "建议：Microsoft Forms → Quick Import 后，再检查 Multiple Answers、Date、Ranking、图片及复杂 Grid 题。"
         )
 
     except json.JSONDecodeError:
@@ -374,6 +456,8 @@ st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
+<strong>V4 Compatibility Mode：</strong>
+复杂题型会先转换成 Quick Import 更容易接受的 Choice / Multiple Answers / Text，然后在转换报告中提示需要手动调整的项目。<br>
 <strong>Privacy：</strong>
 上传内容会使用你本次输入的 Gemini API Key 发送到 Google Gemini API 进行转换；本 App 不会将 API Key 写入 GitHub、文件或数据库。请勿上传不应交由该服务处理的敏感资料。
 </div>
