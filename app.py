@@ -4,6 +4,7 @@ import re
 import json
 import hashlib
 import zipfile
+import time
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -16,7 +17,7 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-APP_VERSION = "V6 Strict Quick Import Format"
+APP_VERSION = "V6.1 Strict Quick Import + Auto Retry"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 
 st.set_page_config(page_title=APP_NAME, page_icon="📝", layout="centered")
@@ -64,6 +65,7 @@ api_key_input = st.text_input(
     help="每次使用时输入。此 App 不会把你的 API Key 写入 GitHub、文件或数据库。"
 )
 st.caption(
+    "🛡️ 若 Gemini 暂时出现 503 / high demand，V6.1 会自动等待重试，并在需要时尝试备用 Flash 模型。\n\n"
     "🔒 API Key 只用于本次页面会话。关闭/刷新页面后请重新输入。"
     "同一个有效的 Gemini API Key 可以重复使用。"
 )
@@ -213,7 +215,7 @@ def build_prompt(form_text: str, answer_text: str, quiz_mode: bool, images) -> s
     )
 
     return f"""
-You are the conversion engine for "Coach Winnie – Forms Converter V6 Image Extraction Mode".
+You are the conversion engine for "Coach Winnie – Forms Converter V6.1 Image Extraction Mode".
 
 GOAL
 Convert a Google Forms print/PDF into a structure optimized for Microsoft Forms Quick Import Word (.docx).
@@ -324,6 +326,82 @@ def normalize_for_quick_import(structured: dict):
             else:
                 q["options"] = []
     return structured
+
+
+def is_temporary_gemini_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    temporary_signals = [
+        "503", "unavailable", "high demand", "temporarily unavailable",
+        "service unavailable", "resource exhausted", "429",
+        "rate limit", "quota exceeded"
+    ]
+    return any(s in msg for s in temporary_signals)
+
+
+def call_gemini_with_retry(api_key: str, prompt: str, status_box=None):
+    """
+    Retry the primary model on temporary 429/503 errors.
+    If it is still busy, try conservative Flash fallbacks.
+    """
+    client = genai.Client(api_key=api_key)
+
+    # Primary first; fallbacks are only used for temporary availability errors.
+    models = []
+    for m in [DEFAULT_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]:
+        if m and m not in models:
+            models.append(m)
+
+    last_error = None
+    for model_index, model_name in enumerate(models):
+        attempts = 3 if model_index == 0 else 2
+
+        for attempt in range(1, attempts + 1):
+            try:
+                if status_box:
+                    if model_index == 0 and attempt == 1:
+                        status_box.write(f"正在连接 Gemini：{model_name}")
+                    elif model_index == 0:
+                        status_box.write(
+                            f"Gemini 当前繁忙，正在自动重试 {attempt-1}/{attempts-1}…"
+                        )
+                    else:
+                        status_box.write(
+                            f"主要模型仍繁忙，正在尝试备用模型：{model_name} "
+                            f"({attempt}/{attempts})"
+                        )
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                return response, model_name
+
+            except Exception as exc:
+                last_error = exc
+
+                # Invalid key / malformed request should fail immediately.
+                if not is_temporary_gemini_error(exc):
+                    raise
+
+                # Exponential-ish short backoff: 3s, 6s; fallback gets 3s.
+                if attempt < attempts:
+                    wait_seconds = 3 * attempt
+                    if status_box:
+                        status_box.write(
+                            f"服务暂时繁忙，{wait_seconds} 秒后再次尝试…"
+                        )
+                    time.sleep(wait_seconds)
+                else:
+                    break
+
+    raise RuntimeError(
+        "Gemini 服务目前繁忙，自动重试及备用模型均未成功。"
+        "请稍后再试。"
+    ) from last_error
 
 
 def build_image_lookup(images):
@@ -471,12 +549,12 @@ def safe_stem(name: str) -> str:
 
 
 def safe_docx_filename(name: str) -> str:
-    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6.docx"
+    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_1.docx"
 
 
 def make_mapping_text(mapping_rows, images):
     lines = [
-        "Coach Winnie – Forms Converter V6",
+        "Coach Winnie – Forms Converter V6.1",
         "Image Mapping Report",
         "",
         "Important: Microsoft Forms Quick Import may not automatically import Word images.",
@@ -569,15 +647,10 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             prompt = build_prompt(form_text, answer_text, quiz_mode, images)
 
             st.write("Gemini 正在识别题型、页码与图片题")
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model=DEFAULT_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
+            response, model_used = call_gemini_with_retry(
+                api_key, prompt, status
             )
+            st.write(f"Gemini 连接成功：{model_used}")
             raw = response.text or ""
             structured = json.loads(clean_json_text(raw))
             structured = normalize_for_quick_import(structured)
@@ -645,7 +718,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         st.download_button(
             "📦 Download Word + Extracted Images ZIP",
             data=bundle_bytes,
-            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_Bundle.zip",
+            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_1_Bundle.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -665,8 +738,18 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         msg = str(e)
         if "API_KEY_INVALID" in msg or "API key not valid" in msg or "INVALID_ARGUMENT" in msg:
             st.error("Gemini API Key 无效或请求设置不正确。请到 Google AI Studio 检查 API Key 后再试。")
-        elif "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-            st.error("Gemini API 当前额度或速率限制已用完。请稍后再试，或检查 Google AI Studio / Google Cloud 的 API 配额。")
+        elif (
+            "RESOURCE_EXHAUSTED" in msg
+            or "429" in msg
+            or "503" in msg
+            or "UNAVAILABLE" in msg
+            or "服务目前繁忙" in msg
+        ):
+            st.error(
+                "Gemini 服务目前繁忙或暂时达到使用限制。"
+                "Mini App 已自动重试并尝试备用模型，但暂时仍无法完成。"
+                "请稍后再按 Convert。"
+            )
         else:
             st.error(f"转换失败：{e}")
 
@@ -675,7 +758,7 @@ st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
-<strong>V6 Strict Quick Import Format：</strong>
+<strong>V6.1 Strict Quick Import + Auto Retry：</strong>
 会从 PDF 提取可识别的原图并嵌入 Word，同时输出独立图片 ZIP 与 image_mapping.txt。<br>
 <strong>重要限制：</strong>
 Microsoft Forms Quick Import 不保证把 Word 内图片自动转换成题目图片；若图片没有带入，请使用 ZIP 内原图手动补回。<br>
