@@ -17,7 +17,7 @@ from google.genai import types
 APP_NAME = "Coach Winnie – Forms Converter"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
-APP_VERSION = "V3.3 Simple 3 Types + Image Extraction"
+APP_VERSION = "V3.3.2 Simple 3 Types + Image Extraction"
 
 st.set_page_config(
     page_title=APP_NAME,
@@ -186,7 +186,7 @@ def call_gemini_stable(api_key: str, prompt: str, status_box=None):
     raise last_error
 
 
-def build_prompt(form_text: str, answer_text: str = "") -> str:
+def build_prompt(form_text: str, answer_text: str = "", ui_language: str = "保持原文件语言") -> str:
     answer_section = ""
     if answer_text.strip():
         answer_section = f"""
@@ -241,6 +241,7 @@ If the original question has selectable options, preserve those options and pref
 Do NOT turn a valid option-based question into Open text merely because formatting is imperfect.
 
 CONTENT RULES
+- Interface/output language preference: {ui_language}
 - Preserve original wording, numbering, order, options, language, names, dates and values.
 - Do not add, rewrite, summarize or invent question content.
 - For grids, preserve the original row order and column choices.
@@ -466,7 +467,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             answer_text = extract_answer_text(answer_file)
 
             quiz_mode = output_mode.startswith("Quiz")
-            prompt = build_prompt(form_text, answer_text, quiz_mode)
+            prompt = build_prompt(form_text, answer_text)
 
             st.write("Gemini 正在识别题目、选项与 Grid / Matching 结构")
             response = call_gemini_stable(
