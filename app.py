@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-APP_VERSION = "V6.1 Strict Quick Import + Auto Retry"
+APP_VERSION = "V6.2 Strict Quick Import + Smart Fallback"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 
 st.set_page_config(page_title=APP_NAME, page_icon="📝", layout="centered")
@@ -65,7 +65,7 @@ api_key_input = st.text_input(
     help="每次使用时输入。此 App 不会把你的 API Key 写入 GitHub、文件或数据库。"
 )
 st.caption(
-    "🛡️ 若 Gemini 暂时出现 503 / high demand，V6.1 会自动等待重试，并在需要时尝试备用 Flash 模型。\n\n"
+    "🛡️ 若 Gemini 暂时出现 503 / high demand，V6.2 会自动重试；若某个模型对新用户不可用，也会自动跳过并尝试当前支持的 Flash 模型。\n\n"
     "🔒 API Key 只用于本次页面会话。关闭/刷新页面后请重新输入。"
     "同一个有效的 Gemini API Key 可以重复使用。"
 )
@@ -215,7 +215,7 @@ def build_prompt(form_text: str, answer_text: str, quiz_mode: bool, images) -> s
     )
 
     return f"""
-You are the conversion engine for "Coach Winnie – Forms Converter V6.1 Image Extraction Mode".
+You are the conversion engine for "Coach Winnie – Forms Converter V6.2 Image Extraction Mode".
 
 GOAL
 Convert a Google Forms print/PDF into a structure optimized for Microsoft Forms Quick Import Word (.docx).
@@ -328,14 +328,27 @@ def normalize_for_quick_import(structured: dict):
     return structured
 
 
-def is_temporary_gemini_error(exc: Exception) -> bool:
+def classify_gemini_error(exc: Exception) -> str:
     msg = str(exc).lower()
+
+    # Model endpoint/access changed: skip this model and try the next supported fallback.
+    model_unavailable_signals = [
+        "404", "not_found", "not found", "no longer available",
+        "model is not available", "model not available"
+    ]
+    if any(s in msg for s in model_unavailable_signals):
+        return "model_unavailable"
+
+    # Temporary capacity/rate issues: retry same model, then fall back.
     temporary_signals = [
         "503", "unavailable", "high demand", "temporarily unavailable",
         "service unavailable", "resource exhausted", "429",
         "rate limit", "quota exceeded"
     ]
-    return any(s in msg for s in temporary_signals)
+    if any(s in msg for s in temporary_signals):
+        return "temporary"
+
+    return "fatal"
 
 
 def call_gemini_with_retry(api_key: str, prompt: str, status_box=None):
@@ -347,7 +360,7 @@ def call_gemini_with_retry(api_key: str, prompt: str, status_box=None):
 
     # Primary first; fallbacks are only used for temporary availability errors.
     models = []
-    for m in [DEFAULT_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]:
+    for m in [DEFAULT_MODEL, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]:
         if m and m not in models:
             models.append(m)
 
@@ -382,12 +395,20 @@ def call_gemini_with_retry(api_key: str, prompt: str, status_box=None):
 
             except Exception as exc:
                 last_error = exc
+                error_kind = classify_gemini_error(exc)
 
-                # Invalid key / malformed request should fail immediately.
-                if not is_temporary_gemini_error(exc):
+                if error_kind == "fatal":
+                    # Invalid API key / malformed request: fail immediately.
                     raise
 
-                # Exponential-ish short backoff: 3s, 6s; fallback gets 3s.
+                if error_kind == "model_unavailable":
+                    if status_box:
+                        status_box.write(
+                            f"{model_name} 对此 API Key / project 不可用，自动跳过并尝试下一个模型…"
+                        )
+                    break
+
+                # Temporary 429/503: retry the same model before falling back.
                 if attempt < attempts:
                     wait_seconds = 3 * attempt
                     if status_box:
@@ -549,12 +570,12 @@ def safe_stem(name: str) -> str:
 
 
 def safe_docx_filename(name: str) -> str:
-    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_1.docx"
+    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_2.docx"
 
 
 def make_mapping_text(mapping_rows, images):
     lines = [
-        "Coach Winnie – Forms Converter V6.1",
+        "Coach Winnie – Forms Converter V6.2",
         "Image Mapping Report",
         "",
         "Important: Microsoft Forms Quick Import may not automatically import Word images.",
@@ -718,7 +739,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         st.download_button(
             "📦 Download Word + Extracted Images ZIP",
             data=bundle_bytes,
-            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_1_Bundle.zip",
+            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_2_Bundle.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -758,7 +779,7 @@ st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
-<strong>V6.1 Strict Quick Import + Auto Retry：</strong>
+<strong>V6.2 Strict Quick Import + Smart Fallback：</strong>
 会从 PDF 提取可识别的原图并嵌入 Word，同时输出独立图片 ZIP 与 image_mapping.txt。<br>
 <strong>重要限制：</strong>
 Microsoft Forms Quick Import 不保证把 Word 内图片自动转换成题目图片；若图片没有带入，请使用 ZIP 内原图手动补回。<br>
