@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-APP_VERSION = "V6.6 Microsoft Forms Import Guidance Format"
+APP_VERSION = "V6.5 Simple 3 Question Types"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 st.set_page_config(page_title=APP_NAME, page_icon="📝", layout="centered")
@@ -70,18 +70,26 @@ st.caption(
     "同一个有效的 Gemini API Key 可以重复使用。"
 )
 
-with st.expander("V6.6 Microsoft Forms Quick Import 格式", expanded=False):
+with st.expander("V6.5 转换规则：只使用 3 种题型", expanded=False):
     st.markdown("""
-**按照 Microsoft Forms Import Guidance：**
+| Google Forms | Mini App 输出到 Word | 导入 Microsoft Forms 后 |
+|---|---|---|
+| Multiple choice / Dropdown / Linear scale / Grid / Likert / Matching | **Choice** | **Choice** |
+| Checkboxes / Checkbox grid | **Multiple-answer Choice** | **Choice** → 请开启 **Multiple answers** |
+| Short answer / Paragraph / 无法安全转换的题型 | **Open text** | **Text** |
 
-- 推荐题型：**Multiple choice**、**Open text**
-- 每一题之间要有清楚分隔
-- 内容要**垂直排列**
-- Quick Import Word **不放图片 / figures**
-- 复杂 Grid / Likert / Matching 会先拆成独立 Choice
-- Checkboxes / Checkbox grid 会输出为 Choice；导入后请手动开启 **Multiple answers**
-- Short answer / Paragraph / 无法安全转换的题型 → Open text
-- 图片会另外保存到 ZIP，不影响 Quick Import Word
+**内部只识别 3 类：**
+1. **Choice**
+2. **Multiple-answer Choice**
+3. **Open text**
+
+- Grid / Likert / Matching：尽量拆成独立 Choice
+- Checkbox grid：每行拆成独立 Multiple-answer Choice
+- 有清楚选项的题，优先保留为 Choice
+- 没有选项或无法安全转换，才转为 Open text
+- 不推测 PDF 中没有显示的答案
+- 不改写、总结或补充原题内容
+- 图片提取独立进行，不参与题型判断
 """)
 
 pdf_file = st.file_uploader("① 上传 Google Forms PDF", type=["pdf"])
@@ -214,19 +222,17 @@ def build_prompt(form_text: str, answer_text: str, quiz_mode: bool, images) -> s
     )
 
     return f"""
-You are the conversion engine for "Coach Winnie – Forms Converter V6.6".
+You are the conversion engine for "Coach Winnie – Forms Converter V6.5".
 
 GOAL
 Convert a Google Forms print/PDF into a structure optimized for Microsoft Forms Quick Import Word (.docx).
 
-IMPORTANT: USE ONLY THESE 3 INTERNAL QUESTION TYPES
+IMPORTANT: USE ONLY THESE 3 QUESTION TYPES
 1. choice
 2. multiple_answers
 3. open_text
 
 Do NOT create or return any other question type.
-The Word renderer will convert both choice and multiple_answers into Microsoft Forms Multiple choice layout.
-Only open_text will render as Microsoft Forms Open text.
 Do NOT classify original_type.
 Do NOT return conversion_action.
 Do NOT create a long taxonomy of Google Forms question types.
@@ -276,7 +282,6 @@ CORE RULES
 6. Do not infer answers. {answer_instruction}
 7. Do not include Google print/UI text as question content.
 8. Image processing is separate from question-type classification.
-   IMPORTANT: images must NOT be embedded inside the Quick Import Word document.
 9. For an image-dependent question:
    - image_required=true
    - source_page = the PDF page number if visible from PAGE markers
@@ -455,13 +460,6 @@ def add_image_to_docx(doc, image_bytes, max_width_inches=5.8):
 
 
 def make_docx(structured: dict, quiz_mode: bool, images):
-    """
-    Microsoft Forms Quick Import guidance format:
-    - Multiple choice: question + vertically stacked A./B./C. options
-    - Open text: question only, no answer lines/placeholders
-    - Clear blank paragraph between questions
-    - NO images/figures embedded in Quick Import Word
-    """
     doc = Document()
 
     normal = doc.styles["Normal"]
@@ -469,79 +467,102 @@ def make_docx(structured: dict, quiz_mode: bool, images):
     normal._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
     normal.font.size = Pt(11)
 
+    lookup = build_image_lookup(images)
+    embedded_ids = set()
     mapping_rows = []
-    embedded_ids = set()  # Intentionally empty for Quick Import Word.
 
-    title = (structured.get("title") or "Microsoft Forms Import").strip()
-    if title:
-        p = doc.add_paragraph()
-        r = p.add_run(title)
-        r.bold = True
-        r.font.size = Pt(16)
+    title = structured.get("title") or "Microsoft Forms Import"
+    p = doc.add_paragraph()
+    r = p.add_run(title)
+    r.bold = True
+    r.font.size = Pt(18)
 
     desc = (structured.get("description") or "").strip()
     if desc:
         doc.add_paragraph(desc)
 
-    global_q_no = 1
-
     for sec in structured.get("sections", []):
         sec_title = (sec.get("title") or "").strip()
         sec_desc = (sec.get("description") or "").strip()
-
-        # Keep section text simple and vertical.
         if sec_title:
             p = doc.add_paragraph()
             r = p.add_run(sec_title)
             r.bold = True
-
+            r.font.size = Pt(14)
         if sec_desc:
             doc.add_paragraph(sec_desc)
 
         for q in sec.get("questions", []):
-            original_num = str(q.get("number") or "").strip()
-            text = str(q.get("question") or "").strip()
-            qtype = str(q.get("output_type") or "open_text").strip()
+            num = (q.get("number") or "").strip()
+            text = (q.get("question") or "").strip()
+            qtype = q.get("output_type", "open_text")
+            required = bool(q.get("required", False))
             image_required = bool(q.get("image_required", False))
             source_page = q.get("source_page")
-            image_refs = list(q.get("image_refs") or [])
+            image_refs = [x for x in (q.get("image_refs") or []) if x in lookup]
 
-            # Prefer original number if present; otherwise use sequential numbering.
-            number_text = original_num if original_num else str(global_q_no)
-            if number_text.endswith("."):
-                question_line = f"{number_text} {text}".strip()
-            else:
-                question_line = f"{number_text}. {text}".strip()
+            prefix = f"{num}. " if num and not str(num).rstrip().endswith(".") else (f"{num} " if num else "")
 
-            # Plain vertical question line.
-            doc.add_paragraph(question_line)
+            # STRICT QUICK IMPORT: visible question text contains only original content.
+            # No "(Multiple Answers)", required asterisk, type marker, or conversion note.
+            p = doc.add_paragraph()
+            rr = p.add_run(f"{prefix}{text}".strip())
+            rr.bold = True
 
-            opts = [str(x).strip() for x in (q.get("options") or []) if str(x).strip()]
+            if image_required:
+                if image_refs:
+                    if len(image_refs) > 1:
+                        note = doc.add_paragraph()
+                        nr = note.add_run(
+                            f"[Original image candidates extracted from PDF page {source_page}; verify the correct image after import]"
+                        )
+                        nr.italic = True
 
-            # Microsoft Forms recommended Multiple choice layout.
+                    inserted = []
+                    for ref in image_refs:
+                        im = lookup[ref]
+                        if add_image_to_docx(doc, im["bytes"]):
+                            embedded_ids.add(ref)
+                            inserted.append(ref)
+                            cap = doc.add_paragraph(f"[{im['filename']}]")
+                            cap.runs[0].italic = True
+
+                    mapping_rows.append({
+                        "question": f"{prefix}{text}".strip(),
+                        "page": source_page,
+                        "image_refs": inserted,
+                        "status": "embedded" if inserted else "extract_failed",
+                    })
+                else:
+                    # Keep technical image instructions OUT of the import DOCX.
+                    # They belong only in image_mapping.txt / conversion report.
+                    mapping_rows.append({
+                        "question": f"{prefix}{text}".strip(),
+                        "page": source_page,
+                        "image_refs": [],
+                        "status": "manual",
+                    })
+
+            opts = q.get("options") or []
+
+            # STRICT QUICK IMPORT:
+            # Choice = visibly lettered options. Text = no options at all.
             if qtype in ("choice", "multiple_answers"):
                 for idx, opt in enumerate(opts):
-                    doc.add_paragraph(f"{option_label(idx)}. {opt}")
-
-            # Open text: no answer line, no placeholder, no technical marker.
+                    doc.add_paragraph(f"{option_label(idx)}. {str(opt).strip()}")
             elif qtype == "open_text":
+                # Intentionally no answer lines/placeholders; Quick Import should see open text.
                 pass
 
-            # Do not embed images in Quick Import Word.
-            if image_required:
-                mapping_rows.append({
-                    "question": question_line,
-                    "page": source_page,
-                    "image_refs": image_refs,
-                    "status": "saved_separately_for_manual_insert",
-                })
+            if quiz_mode:
+                ans = q.get("answer") or []
+                if ans:
+                    label = "Answers: " if len(ans) > 1 else "Answer: "
+                    pa = doc.add_paragraph()
+                    ra = pa.add_run(label + ", ".join(map(str, ans)))
+                    ra.bold = True
 
-            # Avoid inline answer text in Quick Import Word because it can confuse parsing.
-            # Answer data is intentionally kept out of this import document.
-
-            # Clear separation between questions.
             doc.add_paragraph("")
-            global_q_no += 1
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -554,16 +575,16 @@ def safe_stem(name: str) -> str:
 
 
 def safe_docx_filename(name: str) -> str:
-    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_6.docx"
+    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_5.docx"
 
 
 def make_mapping_text(mapping_rows, images):
     lines = [
-        "Coach Winnie – Forms Converter V6.6",
+        "Coach Winnie – Forms Converter V6.5",
         "Image Mapping Report",
         "",
-        "Important: Quick Import Word intentionally contains NO images, following Microsoft Forms import guidance.",
-        "Use this report and the images folder to add images manually after Quick Import.",
+        "Important: Microsoft Forms Quick Import may not automatically import Word images.",
+        "Use this report and the images folder to add images manually after Quick Import when needed.",
         "",
     ]
 
@@ -654,7 +675,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             structured = json.loads(clean_json_text(raw))
             structured = normalize_for_quick_import(structured)
 
-            st.write("生成 Microsoft Forms Quick Import Word（纯文字 / 选项垂直排列，不嵌入图片）")
+            st.write("生成 Microsoft Forms Quick Import Word，并处理图片")
             docx_bytes, mapping_rows, embedded_ids = make_docx(
                 structured, quiz_mode, images
             )
@@ -676,7 +697,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         c4, c5, c6 = st.columns(3)
         c4.metric("PDF 图片", report["extracted_images"])
         c5.metric("图片题", report["image_questions"])
-        c6.metric("Quick Import 内图片", report["embedded_images"])
+        c6.metric("已嵌入 Word", report["embedded_images"])
 
         notes = []
         multi_count = report["output_types"].get("multiple_answers", 0)
@@ -687,8 +708,8 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             )
         if report["image_questions"]:
             notes.append(
-                "图片题：为了符合 Microsoft Forms Import Guidance，Quick Import Word 不放图片。"
-                "原图会保存在 ZIP 的 images 文件夹，请按 image_mapping.txt 在导入后补回。"
+                "图片题：已尽量把 PDF 原图嵌入 Word，并同时放入 ZIP 的 images 文件夹。"
+                "Microsoft Forms Quick Import 可能不会自动带入图片，请按 image_mapping.txt 补图。"
             )
         if report["review_count"]:
             notes.append(
@@ -702,8 +723,6 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             st.info("转换完成，没有检测到需要额外人工检查的题目。")
 
 
-        st.caption("✅ Quick Import Word 已按 Microsoft Forms Import Guidance：Multiple choice / Open text、题目分隔清楚、内容垂直排列、无图片。")
-
         st.download_button(
             "⬇️ Download Microsoft Forms Word",
             data=docx_bytes,
@@ -715,7 +734,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         st.download_button(
             "📦 Download Word + Extracted Images ZIP",
             data=bundle_bytes,
-            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_6_Bundle.zip",
+            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_5_Bundle.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -759,8 +778,8 @@ st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
-<strong>V6.6 Microsoft Forms Import Guidance Format：</strong>
-Quick Import Word 只保留垂直排列的题目与选项，不嵌入图片；图片会另外保存到 ZIP 与 image_mapping.txt。<br>
+<strong>V6.5 Simple 3 Question Types：</strong>
+会从 PDF 提取可识别的原图并嵌入 Word，同时输出独立图片 ZIP 与 image_mapping.txt。<br>
 <strong>重要限制：</strong>
 Microsoft Forms Quick Import 不保证把 Word 内图片自动转换成题目图片；若图片没有带入，请使用 ZIP 内原图手动补回。<br>
 <strong>Privacy：</strong>
