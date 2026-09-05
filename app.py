@@ -17,8 +17,11 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-APP_VERSION = "V6.7 Quiz Answer Letter Format"
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+APP_VERSION = "V7.0 Smart Model Selection"
+DEFAULT_MODEL_MODE = os.getenv("GEMINI_MODEL_MODE", "Auto")
+AUTO_MODEL = os.getenv("GEMINI_AUTO_MODEL", "gemini-flash-latest")
+STABLE_MODEL = os.getenv("GEMINI_STABLE_MODEL", "gemini-3.6-flash")
+LITE_MODEL = os.getenv("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
 
 st.set_page_config(page_title=APP_NAME, page_icon="📝", layout="centered")
 
@@ -63,6 +66,36 @@ api_key_input = st.text_input(
     type="password",
     placeholder="AIza...",
     help="每次使用时输入。此 App 不会把你的 API Key 写入 GitHub、文件或数据库。"
+)
+
+
+st.subheader("🤖 Gemini Model")
+model_mode = st.selectbox(
+    "模型模式",
+    [
+        "Auto – 最新 Flash（推荐）",
+        "Stable – 固定稳定版",
+        "Lite – 较低成本",
+        "Custom – 自订 Model Name",
+    ],
+    index=0,
+    help=(
+        "Auto 使用 gemini-flash-latest；Google 更新 latest alias 时无需修改 App。"
+        "Stable 固定使用目前设定的稳定模型；Lite 适合大量转换；Custom 可输入未来的新模型名称。"
+    ),
+)
+
+custom_model_name = ""
+if model_mode.startswith("Custom"):
+    custom_model_name = st.text_input(
+        "Custom Model Name",
+        placeholder="例如：gemini-3.x-flash",
+        help="请输入 Google Gemini API 实际可用的 model name。"
+    ).strip()
+
+st.caption(
+    "Auto 不会调用 models.list() 扫描全部模型，因此不会增加额外的模型查询请求。"
+    "若 Auto 的 latest alias 暂时不可用，会尝试 Stable，再尝试 Lite。"
 )
 st.caption(
     "🛡️ V6.5：继续使用 gemini-3.6-flash；遇到 503 / high demand 只自动重试一次。题型识别仅保留 3 类，减少 Gemini 判断负担。\n\n"
@@ -216,7 +249,7 @@ def build_prompt(form_text: str, answer_text: str, quiz_mode: bool, images) -> s
     )
 
     return f"""
-You are the conversion engine for "Coach Winnie – Forms Converter V6.7".
+You are the conversion engine for "Coach Winnie – Forms Converter V7.0".
 
 GOAL
 Convert a Google Forms print/PDF into a structure optimized for Microsoft Forms Quick Import Word (.docx).
@@ -364,6 +397,28 @@ def normalize_for_quick_import(structured: dict):
 
     return structured
 
+
+def resolve_model_candidates(model_mode: str, custom_model_name: str = ""):
+    """
+    Return a short, future-friendly model fallback list.
+    No models.list() scan is used.
+    """
+    if model_mode.startswith("Custom"):
+        name = (custom_model_name or "").strip()
+        return [name] if name else []
+
+    if model_mode.startswith("Lite"):
+        return [LITE_MODEL]
+
+    if model_mode.startswith("Stable"):
+        return [STABLE_MODEL]
+
+    # Auto: latest alias first, then known stable/lite fallbacks.
+    candidates = [AUTO_MODEL, STABLE_MODEL, LITE_MODEL]
+    # Remove duplicates while preserving order.
+    return list(dict.fromkeys(x for x in candidates if x))
+
+
 def classify_gemini_error(exc: Exception) -> str:
     msg = str(exc).lower()
 
@@ -387,54 +442,74 @@ def classify_gemini_error(exc: Exception) -> str:
     return "fatal"
 
 
-def call_gemini_with_retry(api_key: str, prompt: str, status_box=None):
+def call_gemini_with_retry(
+    api_key: str,
+    prompt: str,
+    model_mode: str,
+    custom_model_name: str = "",
+    status_box=None,
+):
     """
-    Stable Free API mode:
-    - no models.list() call before conversion;
-    - use gemini-3.6-flash directly;
-    - retry a temporary 429/503 only once;
-    - keep the error message short and teacher-friendly.
+    Smart model selection:
+    - Auto -> gemini-flash-latest -> Stable -> Lite
+    - Stable -> fixed stable model
+    - Lite -> fixed low-cost model
+    - Custom -> user-supplied model name
+    - no models.list() scan
+    - one retry for temporary 429/503 per selected model
     """
     client = genai.Client(api_key=api_key)
-    model_name = DEFAULT_MODEL
+    candidates = resolve_model_candidates(model_mode, custom_model_name)
+
+    if not candidates:
+        raise ValueError("请先输入 Custom Model Name。")
+
     last_error = None
 
-    for attempt in range(1, 3):
-        try:
-            if status_box:
-                if attempt == 1:
-                    status_box.write(f"正在连接 Gemini：{model_name}")
-                else:
-                    status_box.write("Gemini 暂时繁忙，正在进行最后一次自动重试…")
-
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            return response, model_name
-
-        except Exception as exc:
-            last_error = exc
-            error_kind = classify_gemini_error(exc)
-
-            # Invalid key, malformed request, or a model endpoint problem:
-            # don't create a long retry loop.
-            if error_kind in ("fatal", "model_unavailable"):
-                raise
-
-            if attempt == 1:
+    for model_name in candidates:
+        for attempt in range(1, 3):
+            try:
                 if status_box:
-                    status_box.write("服务暂时繁忙，3 秒后再试一次…")
-                time.sleep(3)
+                    if attempt == 1:
+                        status_box.write(f"正在连接 Gemini：{model_name}")
+                    else:
+                        status_box.write(f"{model_name} 暂时繁忙，正在进行最后一次自动重试…")
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
+                )
+                return response, model_name
+
+            except Exception as exc:
+                last_error = exc
+                error_kind = classify_gemini_error(exc)
+
+                if error_kind == "fatal":
+                    raise
+
+                # 404 / retired / unavailable endpoint: move to next candidate immediately.
+                if error_kind == "model_unavailable":
+                    if status_box and len(candidates) > 1:
+                        status_box.write(f"{model_name} 不可用，正在尝试备用模型…")
+                    break
+
+                # Temporary 429 / 503: retry once on same model.
+                if error_kind == "temporary" and attempt == 1:
+                    if status_box:
+                        status_box.write("服务暂时繁忙，3 秒后再试一次…")
+                    time.sleep(3)
+                    continue
+
+                # Temporary failure after retry: move to next candidate when available.
+                break
 
     raise RuntimeError(
-        "Gemini 服务目前繁忙。Mini App 已自动重试一次，请稍后再按 Convert。"
+        "Gemini 当前可用模型暂时无法完成请求。请稍后再试，或切换 Stable / Lite / Custom。"
     ) from last_error
-
 
 def build_image_lookup(images):
     return {im["id"]: im for im in images}
@@ -611,12 +686,12 @@ def safe_stem(name: str) -> str:
 
 
 def safe_docx_filename(name: str) -> str:
-    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_7.docx"
+    return f"{safe_stem(name)}_Microsoft_Forms_Import_V7_0.docx"
 
 
 def make_mapping_text(mapping_rows, images):
     lines = [
-        "Coach Winnie – Forms Converter V6.7",
+        "Coach Winnie – Forms Converter V7.0",
         "Image Mapping Report",
         "",
         "Important: Quick Import Word intentionally contains NO images, following Microsoft Forms import guidance.",
@@ -704,7 +779,11 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
 
             st.write("Gemini 正在按 3 种题型识别：Choice / Multiple-answer Choice / Open text")
             response, model_used = call_gemini_with_retry(
-                api_key, prompt, status
+                api_key,
+                prompt,
+                model_mode=model_mode,
+                custom_model_name=custom_model_name,
+                status_box=status,
             )
             st.write(f"Gemini 连接成功：{model_used}")
             raw = response.text or ""
@@ -772,7 +851,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         st.download_button(
             "📦 Download Word + Extracted Images ZIP",
             data=bundle_bytes,
-            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_7_Bundle.zip",
+            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V7_0_Bundle.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -816,8 +895,8 @@ st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
-<strong>V6.7 Quiz Answer Letter Format：</strong>
-Quick Import Word 只保留垂直排列的题目与选项，不嵌入图片；图片会另外保存到 ZIP 与 image_mapping.txt。<br>Quiz 模式若上传答案文件，选择题答案以英文选项字母输出，例如 <strong>Answer: A</strong>；没有答案的题不会推测。<br>
+<strong>V7.0 Smart Model Selection：</strong>
+Quick Import Word 只保留垂直排列的题目与选项，不嵌入图片；图片会另外保存到 ZIP 与 image_mapping.txt。<br>Quiz 模式若上传答案文件，选择题答案以英文选项字母输出，例如 <strong>Answer: A</strong>；没有答案的题不会推测。<br>模型选择：Auto 使用 <strong>gemini-flash-latest</strong>；也可选择 Stable、Lite 或 Custom。<br>
 <strong>重要限制：</strong>
 Microsoft Forms Quick Import 不保证把 Word 内图片自动转换成题目图片；若图片没有带入，请使用 ZIP 内原图手动补回。<br>
 <strong>Privacy：</strong>
