@@ -17,11 +17,8 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-APP_VERSION = "V7.1 Teacher-Friendly Error Handling"
-DEFAULT_MODEL_MODE = os.getenv("GEMINI_MODEL_MODE", "Auto")
-AUTO_MODEL = os.getenv("GEMINI_AUTO_MODEL", "gemini-flash-latest")
-STABLE_MODEL = os.getenv("GEMINI_STABLE_MODEL", "gemini-3.6-flash")
-LITE_MODEL = os.getenv("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
+APP_VERSION = "V6.8 Low Token Mode"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 st.set_page_config(page_title=APP_NAME, page_icon="📝", layout="centered")
 
@@ -67,43 +64,13 @@ api_key_input = st.text_input(
     placeholder="AIza...",
     help="每次使用时输入。此 App 不会把你的 API Key 写入 GitHub、文件或数据库。"
 )
-
-
-st.subheader("🤖 Gemini Model")
-model_mode = st.selectbox(
-    "模型模式",
-    [
-        "Auto – 最新 Flash（推荐）",
-        "Stable – 固定稳定版",
-        "Lite – 较低成本",
-        "Custom – 自订 Model Name",
-    ],
-    index=0,
-    help=(
-        "Auto 使用 gemini-flash-latest；Google 更新 latest alias 时无需修改 App。"
-        "Stable 固定使用目前设定的稳定模型；Lite 适合大量转换；Custom 可输入未来的新模型名称。"
-    ),
-)
-
-custom_model_name = ""
-if model_mode.startswith("Custom"):
-    custom_model_name = st.text_input(
-        "Custom Model Name",
-        placeholder="例如：gemini-3.x-flash",
-        help="请输入 Google Gemini API 实际可用的 model name。"
-    ).strip()
-
-st.caption(
-    "Auto 不会调用 models.list() 扫描全部模型，因此不会增加额外的模型查询请求。"
-    "若 Auto 的 latest alias 暂时不可用，会尝试 Stable，再尝试 Lite。"
-)
 st.caption(
     "🛡️ V6.5：继续使用 gemini-3.6-flash；遇到 503 / high demand 只自动重试一次。题型识别仅保留 3 类，减少 Gemini 判断负担。\n\n"
     "🔒 API Key 只用于本次页面会话。关闭/刷新页面后请重新输入。"
     "同一个有效的 Gemini API Key 可以重复使用。"
 )
 
-with st.expander("V6.7 Microsoft Forms Quick Import + Quiz Answer 格式", expanded=False):
+with st.expander("V6.8 Low Token Mode 转换规则", expanded=False):
     st.markdown("""
 **按照 Microsoft Forms Import Guidance：**
 
@@ -218,6 +185,73 @@ def extract_answer_text(uploaded) -> str:
     return data.decode("utf-8", errors="ignore")
 
 
+
+def parse_answer_key(answer_text: str) -> dict:
+    """
+    Parse simple answer keys locally, e.g.
+    (1) A
+    (2) B
+    3. D
+    4 B
+    (5) A, C
+    No Gemini call is needed.
+    """
+    answer_map = {}
+    if not answer_text:
+        return answer_map
+
+    for raw_line in answer_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # Question number + one or more English answer letters.
+        m = re.match(
+            r"^\s*[\(\[]?\s*(\d+)\s*[\)\]\.\:\-]*\s*"
+            r"([A-Za-z](?:\s*[,/;&+]\s*[A-Za-z])*)\s*$",
+            line,
+        )
+        if not m:
+            continue
+
+        qno = str(int(m.group(1)))
+        letters = re.findall(r"[A-Za-z]", m.group(2).upper())
+        if letters:
+            answer_map[qno] = list(dict.fromkeys(letters))
+
+    return answer_map
+
+
+def normalize_question_number(value, fallback=None):
+    """Normalize '(12)', '12.', 'Q12' etc. to '12' for local answer matching."""
+    text = str(value or "").strip()
+    m = re.search(r"\d+", text)
+    if m:
+        return str(int(m.group(0)))
+    return str(fallback) if fallback is not None else ""
+
+
+def apply_local_answer_key(structured: dict, answer_map: dict):
+    """
+    Attach answers locally by question number.
+    Only explicit letters from the uploaded answer file are used.
+    """
+    seq = 1
+    matched = 0
+
+    for sec in structured.get("sections", []):
+        for q in sec.get("questions", []):
+            qno = normalize_question_number(q.get("number"), fallback=seq)
+            letters = answer_map.get(qno, [])
+            q["answer"] = letters
+            if letters:
+                matched += 1
+            seq += 1
+
+    return structured, matched
+
+
+
 def clean_json_text(s: str) -> str:
     s = s.strip()
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I)
@@ -240,118 +274,46 @@ def image_inventory_text(images) -> str:
     return "\n".join(rows)
 
 
-def build_prompt(form_text: str, answer_text: str, quiz_mode: bool, images) -> str:
-    answer_instruction = (
-        "An answer source is provided. Add answers ONLY when explicitly supported by that answer source. "
-        "Never infer missing answers."
-        if answer_text else
-        "No answer source is provided. Do NOT infer or invent any answer."
-    )
-
+def build_prompt(form_text: str) -> str:
+    """Minimal prompt: Gemini only parses questions and 3 output types."""
     return f"""
-You are the conversion engine for "Coach Winnie – Forms Converter V7.1".
+Convert this Google Forms PDF text to JSON for Microsoft Forms Quick Import.
 
-GOAL
-Convert a Google Forms print/PDF into a structure optimized for Microsoft Forms Quick Import Word (.docx).
+USE ONLY 3 TYPES:
+- choice
+- multiple_answers
+- open_text
 
-IMPORTANT: USE ONLY THESE 3 INTERNAL QUESTION TYPES
-1. choice
-2. multiple_answers
-3. open_text
+MAPPING:
+- Multiple choice / Dropdown / Linear scale -> choice
+- Grid / Likert / Matching -> split each row into separate choice questions
+- Checkboxes / Checkbox grid -> multiple_answers; split checkbox-grid rows
+- Short answer / Paragraph / unsafe-to-convert -> open_text
 
-Do NOT create or return any other question type.
-The Word renderer will convert both choice and multiple_answers into Microsoft Forms Multiple choice layout.
-Only open_text will render as Microsoft Forms Open text.
-Do NOT classify original_type.
-Do NOT return conversion_action.
-Do NOT create a long taxonomy of Google Forms question types.
+RULES:
+- Preserve original title, sections, question order, wording and options.
+- If visible selectable options exist, preserve them; do not change to open_text just because PDF formatting is imperfect.
+- Never invent missing content or answers.
+- For image-dependent questions, set image_required=true and source_page from PAGE markers when clear.
+- No answer processing. Python handles quiz answers separately.
+- JSON only.
 
-SIMPLE CLASSIFICATION
-
-A. choice
-Use "choice" when the original question has selectable options and only one answer is expected.
-Examples include:
-- Multiple choice
-- Dropdown
-- Linear scale
-- Multiple choice Grid
-- Likert-style Grid
-- Matching
-- Other clearly option-based single-answer questions
-
-For Grid / Likert / Matching:
-- Split EACH ROW / statement into a separate choice question when the structure is clear.
-- Preserve shared column/choice labels as options.
-- Preserve original row order.
-- If there is an overall title, combine ONLY original text as "<title> — <row label>".
-
-B. multiple_answers
-Use "multiple_answers" only when multiple selections are allowed.
-Examples include:
-- Checkboxes
-- Checkbox Grid
-
-For Checkbox Grid:
-- Split EACH ROW into a separate multiple_answers question.
-- Preserve shared column/choice labels as options.
-
-C. open_text
-Use "open_text" for:
-- Short answer
-- Paragraph
-- Questions with no selectable options
-- Questions that cannot be safely converted into Choice without inventing content
-
-CORE RULES
-1. If the original question clearly has selectable options, preserve them and prefer choice / multiple_answers.
-2. Do NOT turn a valid option-based question into open_text merely because PDF formatting is imperfect.
-3. If options are genuinely missing or unsafe to reconstruct, use open_text and set review_required=true.
-4. Preserve original title, section order, question order, wording, numbering, language, names, dates, values and options.
-5. Do not add, delete, rewrite, summarize, correct, explain or supplement question content.
-6. Do not infer answers. {answer_instruction}
-7. Do not include Google print/UI text as question content.
-8. Image processing is separate from question-type classification.
-   IMPORTANT: images must NOT be embedded inside the Quick Import Word document.
-9. For an image-dependent question:
-   - image_required=true
-   - source_page = the PDF page number if visible from PAGE markers
-   - image_refs may contain ONLY ids from IMAGE INVENTORY and only from the same source page
-   - never invent an image id
-10. If image matching is uncertain, leave image_refs empty and set review_required=true.
-
-QUIZ MODE
-quiz_mode = {str(quiz_mode).lower()}
-If quiz_mode is false, leave answers empty.
-If quiz_mode is true, include answers ONLY when explicitly supported by the answer source.
-
-ANSWER FORMAT FOR QUIZ
-- For choice and multiple_answers questions, return the answer as ENGLISH OPTION LETTERS only: A, B, C, D, E, ...
-- Example: if the answer source says "(1) A", return ["A"].
-- If the answer source gives the exact option text instead of a letter, map it to the corresponding English option letter only when the match is explicit.
-- For multiple correct options, return multiple English letters, e.g. ["A", "C"].
-- Never guess a letter.
-- If the answer source has no answer for that question, return [].
-- Do not add "Answer:" inside the JSON answer value; the Word renderer will add that label.
-
-RETURN STRICT JSON ONLY:
+SCHEMA:
 {{
-  "title": "string",
-  "description": "string",
+  "title": "",
+  "description": "",
   "sections": [
     {{
-      "title": "string",
-      "description": "string",
+      "title": "",
+      "description": "",
       "questions": [
         {{
-          "number": "string",
-          "question": "string",
+          "number": "",
+          "question": "",
           "output_type": "choice|multiple_answers|open_text",
-          "options": ["string"],
-          "answer": ["string"],
-          "required": true,
+          "options": [],
           "image_required": false,
-          "source_page": 1,
-          "image_refs": ["P01_IMG01"],
+          "source_page": null,
           "review_required": false
         }}
       ]
@@ -359,17 +321,8 @@ RETURN STRICT JSON ONLY:
   ]
 }}
 
-FORM TEXT
-----------------
+FORM TEXT:
 {form_text}
-
-IMAGE INVENTORY
-----------------
-{image_inventory_text(images)}
-
-OPTIONAL ANSWER SOURCE
-----------------
-{answer_text if answer_text else "(none)"}
 """
 
 def normalize_for_quick_import(structured: dict):
@@ -397,86 +350,22 @@ def normalize_for_quick_import(structured: dict):
 
     return structured
 
-
-def resolve_model_candidates(model_mode: str, custom_model_name: str = ""):
-    """
-    Return a short, future-friendly model fallback list.
-    No models.list() scan is used.
-    """
-    if model_mode.startswith("Custom"):
-        name = (custom_model_name or "").strip()
-        return [name] if name else []
-
-    if model_mode.startswith("Lite"):
-        return [LITE_MODEL]
-
-    if model_mode.startswith("Stable"):
-        return [STABLE_MODEL]
-
-    # Auto: latest alias first, then known stable/lite fallbacks.
-    candidates = [AUTO_MODEL, STABLE_MODEL, LITE_MODEL]
-    # Remove duplicates while preserving order.
-    return list(dict.fromkeys(x for x in candidates if x))
-
-
 def classify_gemini_error(exc: Exception) -> str:
-    """
-    Classify Gemini API errors into teacher-friendly categories.
-    SERVICE_DISABLED and permission errors must stop immediately;
-    they should NOT trigger retry/fallback.
-    """
     msg = str(exc).lower()
 
-    # API not enabled for the project.
-    if (
-        "service_disabled" in msg
-        or "gemini api has not been used in project" in msg
-        or "generativelanguage.googleapis.com" in msg and "disabled" in msg
-    ):
-        return "service_disabled"
-
-    # Invalid API key / auth problem.
-    if (
-        "api_key_invalid" in msg
-        or "api key not valid" in msg
-        or "invalid api key" in msg
-        or "unauthenticated" in msg
-        or "401" in msg
-    ):
-        return "invalid_key"
-
-    # Permission denied at project/account level.
-    if (
-        "permission_denied" in msg
-        or "the caller does not have permission" in msg
-        or "403" in msg
-    ):
-        return "permission_denied"
-
-    # Model endpoint/access changed or model unavailable.
+    # Model endpoint/access changed: skip this model and try the next supported fallback.
     model_unavailable_signals = [
-        "404",
-        "not_found",
-        "not found",
-        "no longer available",
-        "model is not available",
-        "model not available",
-        "unsupported model",
+        "404", "not_found", "not found", "no longer available",
+        "model is not available", "model not available"
     ]
     if any(s in msg for s in model_unavailable_signals):
         return "model_unavailable"
 
-    # Temporary capacity / quota conditions.
+    # Temporary capacity/rate issues: retry same model, then fall back.
     temporary_signals = [
-        "503",
-        "unavailable",
-        "high demand",
-        "temporarily unavailable",
-        "service unavailable",
-        "resource exhausted",
-        "429",
-        "rate limit",
-        "quota exceeded",
+        "503", "unavailable", "high demand", "temporarily unavailable",
+        "service unavailable", "resource exhausted", "429",
+        "rate limit", "quota exceeded"
     ]
     if any(s in msg for s in temporary_signals):
         return "temporary"
@@ -484,79 +373,99 @@ def classify_gemini_error(exc: Exception) -> str:
     return "fatal"
 
 
-
-def call_gemini_with_retry(
-    api_key: str,
-    prompt: str,
-    model_mode: str,
-    custom_model_name: str = "",
-    status_box=None,
-):
+def call_gemini_with_retry(api_key: str, prompt: str, status_box=None):
     """
-    Smart model selection with safe retry behavior:
-    - Auto -> latest -> stable -> lite
-    - 429 / 503: retry once, then fallback
-    - model unavailable: fallback to next candidate
-    - SERVICE_DISABLED / 403 permission / invalid key: stop immediately
+    Stable Free API mode:
+    - no models.list() call before conversion;
+    - use gemini-3.6-flash directly;
+    - retry a temporary 429/503 only once;
+    - keep the error message short and teacher-friendly.
     """
     client = genai.Client(api_key=api_key)
-    candidates = resolve_model_candidates(model_mode, custom_model_name)
-
-    if not candidates:
-        raise ValueError("请先输入 Custom Model Name。")
-
+    model_name = DEFAULT_MODEL
     last_error = None
 
-    for model_name in candidates:
-        for attempt in range(1, 3):
-            try:
+    for attempt in range(1, 3):
+        try:
+            if status_box:
+                if attempt == 1:
+                    status_box.write(f"正在连接 Gemini：{model_name}")
+                else:
+                    status_box.write("Gemini 暂时繁忙，正在进行最后一次自动重试…")
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            return response, model_name
+
+        except Exception as exc:
+            last_error = exc
+            error_kind = classify_gemini_error(exc)
+
+            # Invalid key, malformed request, or a model endpoint problem:
+            # don't create a long retry loop.
+            if error_kind in ("fatal", "model_unavailable"):
+                raise
+
+            if attempt == 1:
                 if status_box:
-                    if attempt == 1:
-                        status_box.write(f"正在连接 Gemini：{model_name}")
-                    else:
-                        status_box.write(f"{model_name} 暂时繁忙，正在进行最后一次自动重试…")
-
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                    ),
-                )
-                return response, model_name
-
-            except Exception as exc:
-                last_error = exc
-                error_kind = classify_gemini_error(exc)
-
-                # These are NOT model problems and must not be retried/fallback.
-                if error_kind in (
-                    "service_disabled",
-                    "permission_denied",
-                    "invalid_key",
-                    "fatal",
-                ):
-                    raise
-
-                # Model unavailable: move to next candidate immediately.
-                if error_kind == "model_unavailable":
-                    if status_box and len(candidates) > 1:
-                        status_box.write(f"{model_name} 不可用，正在尝试备用模型…")
-                    break
-
-                # Temporary 429 / 503: retry once on the same model.
-                if error_kind == "temporary" and attempt == 1:
-                    if status_box:
-                        status_box.write("Gemini 服务暂时繁忙，3 秒后自动重试一次…")
-                    time.sleep(3)
-                    continue
-
-                # After retry failure, move to next candidate.
-                break
+                    status_box.write("服务暂时繁忙，3 秒后再试一次…")
+                time.sleep(3)
 
     raise RuntimeError(
-        "Gemini 当前可用模型暂时无法完成请求。请稍后再试，或切换 Stable / Lite / Custom。"
+        "Gemini 服务目前繁忙。Mini App 已自动重试一次，请稍后再按 Convert。"
     ) from last_error
+
+
+
+def attach_page_image_candidates(structured: dict, images):
+    """
+    Map extracted PDF images to questions by source page locally.
+    Gemini does not receive image inventory, reducing input tokens.
+    """
+    by_page = defaultdict(list)
+    for im in images:
+        by_page[im.get("page")].append(im.get("id"))
+
+    for sec in structured.get("sections", []):
+        for q in sec.get("questions", []):
+            if q.get("image_required"):
+                page = q.get("source_page")
+                refs = [x for x in by_page.get(page, []) if x]
+                q["image_refs"] = refs
+                if len(refs) != 1:
+                    q["review_required"] = True
+            else:
+                q["image_refs"] = []
+
+    return structured
+
+
+def extract_usage_tokens(response):
+    """Read Gemini usage metadata when the SDK returns it."""
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return {"input": None, "output": None, "total": None}
+
+    def get_value(*names):
+        for name in names:
+            value = getattr(usage, name, None)
+            if value is not None:
+                return int(value)
+        return None
+
+    return {
+        "input": get_value("prompt_token_count", "input_token_count"),
+        "output": get_value("candidates_token_count", "output_token_count"),
+        "total": get_value("total_token_count"),
+    }
+
+
 
 def build_image_lookup(images):
     return {im["id"]: im for im in images}
@@ -733,12 +642,12 @@ def safe_stem(name: str) -> str:
 
 
 def safe_docx_filename(name: str) -> str:
-    return f"{safe_stem(name)}_Microsoft_Forms_Import_V7_1.docx"
+    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_8.docx"
 
 
 def make_mapping_text(mapping_rows, images):
     lines = [
-        "Coach Winnie – Forms Converter V7.1",
+        "Coach Winnie – Forms Converter V6.8",
         "Image Mapping Report",
         "",
         "Important: Quick Import Word intentionally contains NO images, following Microsoft Forms import guidance.",
@@ -798,61 +707,6 @@ def build_conversion_report(structured: dict, images, embedded_ids):
     }
 
 
-def show_teacher_friendly_error(exc: Exception):
-    """Display short, actionable errors instead of raw Google exception payloads."""
-    kind = classify_gemini_error(exc)
-
-    if kind == "service_disabled":
-        st.error(
-            "⚠️ Gemini API 尚未启用\n\n"
-            "这个 API Key 所属的 Google Cloud Project 尚未启用 Gemini API / Generative Language API。\n\n"
-            "请先在对应 Project 启用 Gemini API，等待几分钟后再重新转换。\n\n"
-            "更换 Gemini Model 无法解决此问题。"
-        )
-        st.info(
-            "建议：如果这是老师第一次建立 API Key，也可以直接到 Google AI Studio 建立新的 API Key，"
-            "并确认该 Key 所属 Project 已启用 Gemini API。"
-        )
-        return
-
-    if kind == "permission_denied":
-        st.error(
-            "⚠️ 这个 API Key / Project 没有 Gemini 内容生成权限\n\n"
-            "请检查该 API Key 所属的 Google Project 是否允许使用 Gemini API。"
-        )
-        st.info(
-            "建议：可尝试在 Google AI Studio 建立一个新的 API Key，并使用新的 Project 测试。"
-        )
-        return
-
-    if kind == "invalid_key":
-        st.error(
-            "⚠️ Gemini API Key 无效\n\n"
-            "请检查 API Key 是否完整、是否复制正确，或重新在 Google AI Studio 建立新的 API Key。"
-        )
-        return
-
-    if kind == "model_unavailable":
-        st.error(
-            "⚠️ 当前选择的 Gemini Model 不可用\n\n"
-            "请改用 Auto、Stable、Lite，或输入另一个可用的 Custom Model Name。"
-        )
-        return
-
-    if kind == "temporary":
-        st.error(
-            "⚠️ Gemini 服务暂时繁忙或达到使用限制\n\n"
-            "Mini App 已自动重试。请稍后再试，或切换到另一个 Model。"
-        )
-        return
-
-    st.error(
-        "转换失败。请重新检查 API Key、Model 设定与上传文件后再试。"
-    )
-
-
-
-
 if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_container_width=True):
     if not pdf_file:
         st.error("请先上传 Google Forms PDF。")
@@ -875,24 +729,31 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
 
             st.write("读取答案文件" if answer_file else "没有答案文件，将不会推测答案")
             answer_text = extract_answer_text(answer_file)
+            answer_map = parse_answer_key(answer_text)
 
             quiz_mode = output_mode.startswith("Quiz")
-            prompt = build_prompt(form_text, answer_text, quiz_mode, images)
+            prompt = build_prompt(form_text)
 
-            st.write("Gemini 正在按 3 种题型识别：Choice / Multiple-answer Choice / Open text")
+            st.write("Low Token Mode：Gemini 只识别题目结构与 3 种题型")
             response, model_used = call_gemini_with_retry(
-                api_key,
-                prompt,
-                model_mode=model_mode,
-                custom_model_name=custom_model_name,
-                status_box=status,
+                api_key, prompt, status
             )
             st.write(f"Gemini 连接成功：{model_used}")
             raw = response.text or ""
             structured = json.loads(clean_json_text(raw))
             structured = normalize_for_quick_import(structured)
 
-            st.write("生成 Microsoft Forms Quick Import Word（纯文字 / 选项垂直排列，不嵌入图片）")
+            # Python handles images and quiz answers locally.
+            structured = attach_page_image_candidates(structured, images)
+            matched_answers = 0
+            if quiz_mode and answer_map:
+                structured, matched_answers = apply_local_answer_key(structured, answer_map)
+            else:
+                structured, _ = apply_local_answer_key(structured, {})
+
+            usage_tokens = extract_usage_tokens(response)
+
+            st.write("Python 正在处理答案、图片对应与 Word 排版")
             docx_bytes, mapping_rows, embedded_ids = make_docx(
                 structured, quiz_mode, images
             )
@@ -915,6 +776,18 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         c4.metric("PDF 图片", report["extracted_images"])
         c5.metric("图片题", report["image_questions"])
         c6.metric("Quick Import 内图片", report["embedded_images"])
+
+        st.subheader("⚡ Low Token Mode")
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Input Tokens", usage_tokens["input"] if usage_tokens["input"] is not None else "—")
+        t2.metric("Output Tokens", usage_tokens["output"] if usage_tokens["output"] is not None else "—")
+        t3.metric("Total Tokens", usage_tokens["total"] if usage_tokens["total"] is not None else "—")
+
+        if quiz_mode and answer_file:
+            st.caption(
+                f"✅ 答案文件由 Python 本地配对：读取 {len(answer_map)} 个答案，"
+                f"成功对应 {matched_answers} 题；答案内容没有发送给 Gemini。"
+            )
 
         notes = []
         multi_count = report["output_types"].get("multiple_answers", 0)
@@ -953,7 +826,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         st.download_button(
             "📦 Download Word + Extracted Images ZIP",
             data=bundle_bytes,
-            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V7_1_Bundle.zip",
+            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_8_Bundle.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -968,20 +841,37 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         )
 
     except json.JSONDecodeError:
-        st.error(
-            "Gemini 输出无法解析为结构化数据。请再试一次；"
-            "如果 PDF 很复杂，可尝试分成较小部分转换。"
-        )
+        st.error("Gemini 输出无法解析为结构化数据，请重试。若 PDF 很复杂，可分成较小部分转换。")
     except Exception as e:
-        show_teacher_friendly_error(e)
+        msg = str(e)
+        if "API_KEY_INVALID" in msg or "API key not valid" in msg or "INVALID_ARGUMENT" in msg:
+            st.error("Gemini API Key 无效或请求设置不正确。请到 Google AI Studio 检查 API Key 后再试。")
+        elif "404" in msg or "NOT_FOUND" in msg or "no longer available" in msg:
+            st.error(
+                "当前 Gemini 模型对此 API Key / project 不可用。"
+                "请检查 Google AI Studio 中该 project 可使用的模型。"
+            )
+        elif (
+            "RESOURCE_EXHAUSTED" in msg
+            or "429" in msg
+            or "503" in msg
+            or "UNAVAILABLE" in msg
+            or "服务目前繁忙" in msg
+        ):
+            st.error(
+                "Gemini 服务目前繁忙或暂时达到 Free API 使用限制。"
+                "Mini App 已自动重试一次，请稍后再按 Convert。"
+            )
+        else:
+            st.error(f"转换失败：{e}")
 
 st.divider()
 st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
-<strong>V7.1 Teacher-Friendly Error Handling：</strong>
-Quick Import Word 只保留垂直排列的题目与选项，不嵌入图片；图片会另外保存到 ZIP 与 image_mapping.txt。<br>Quiz 模式若上传答案文件，选择题答案以英文选项字母输出，例如 <strong>Answer: A</strong>；没有答案的题不会推测。<br>模型选择：Auto 使用 <strong>gemini-flash-latest</strong>；也可选择 Stable、Lite 或 Custom。<br>
+<strong>V6.8 Low Token Mode：</strong>
+Gemini 只负责题目解析与 3 种题型分类；答案配对、A/B/C/D、图片 ZIP 与 Word 排版由 Python 完成，以减少 Tokens。<br>Quiz 模式若上传答案文件，选择题答案仍以英文选项字母输出，例如 <strong>Answer: A</strong>；没有答案的题不会推测。<br>
 <strong>重要限制：</strong>
 Microsoft Forms Quick Import 不保证把 Word 内图片自动转换成题目图片；若图片没有带入，请使用 ZIP 内原图手动补回。<br>
 <strong>Privacy：</strong>
