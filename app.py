@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-APP_VERSION = "V6.8 Low Token Mode"
+APP_VERSION = "V6.9 Fast + Low Token Mode"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 st.set_page_config(page_title=APP_NAME, page_icon="📝", layout="centered")
@@ -70,7 +70,7 @@ st.caption(
     "同一个有效的 Gemini API Key 可以重复使用。"
 )
 
-with st.expander("V6.8 Low Token Mode 转换规则", expanded=False):
+with st.expander("V6.9 Fast + Low Token Mode 转换规则", expanded=False):
     st.markdown("""
 **按照 Microsoft Forms Import Guidance：**
 
@@ -115,6 +115,60 @@ def extract_pdf_text(data: bytes) -> str:
         txt = page.get_text("text")
         chunks.append(f"\n===== PAGE {i+1} =====\n{txt}")
     return "\n".join(chunks)
+
+
+def clean_form_text_for_gemini(text: str) -> str:
+    """
+    Remove common Google Forms / print-view UI noise while preserving:
+    - PAGE markers
+    - original question text
+    - original options
+    - section/title content
+    """
+    if not text:
+        return ""
+
+    noise_patterns = [
+        r"^\s*Clear selection\s*$",
+        r"^\s*Required\s*$",
+        r"^\s*\*\s*$",
+        r"^\s*Never submit passwords through Google Forms.*$",
+        r"^\s*This form was created inside.*$",
+        r"^\s*Report Abuse\s*$",
+        r"^\s*Google Forms\s*$",
+        r"^\s*Page\s+\d+\s+of\s+\d+\s*$",
+        r"^\s*Back\s*$",
+        r"^\s*Next\s*$",
+        r"^\s*Submit\s*$",
+    ]
+
+    cleaned_lines = []
+    last_blank = False
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+
+        if any(re.match(pat, line, flags=re.I) for pat in noise_patterns):
+            continue
+
+        # Keep PAGE markers exactly because image questions may need source_page.
+        if line.startswith("===== PAGE "):
+            cleaned_lines.append(line)
+            last_blank = False
+            continue
+
+        # Collapse repeated blank lines.
+        if not line.strip():
+            if not last_blank:
+                cleaned_lines.append("")
+            last_blank = True
+            continue
+
+        cleaned_lines.append(line)
+        last_blank = False
+
+    return "\n".join(cleaned_lines).strip()
+
 
 
 def extract_pdf_images(data: bytes):
@@ -166,6 +220,81 @@ def extract_pdf_images(data: bytes):
             })
 
     return images
+
+
+def extract_pdf_images_for_pages(data: bytes, wanted_pages=None):
+    """
+    Lazy image extraction:
+    - if wanted_pages is empty/None -> return []
+    - otherwise extract only from those PDF pages
+    """
+    pages = {int(p) for p in (wanted_pages or []) if p}
+    if not pages:
+        return []
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    images = []
+    seen = set()
+
+    for page_no, page in enumerate(doc, start=1):
+        if page_no not in pages:
+            continue
+
+        page_imgs = page.get_images(full=True)
+        page_index = 0
+
+        for img in page_imgs:
+            xref = img[0]
+            try:
+                info = doc.extract_image(xref)
+            except Exception:
+                continue
+
+            blob = info.get("image", b"")
+            width = int(info.get("width", 0) or 0)
+            height = int(info.get("height", 0) or 0)
+            ext = (info.get("ext") or "png").lower()
+
+            if not blob or len(blob) < 2500:
+                continue
+            if width < 120 or height < 80 or width * height < 25000:
+                continue
+
+            digest = hashlib.sha1(blob).hexdigest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+
+            page_index += 1
+            image_id = f"P{page_no:02d}_IMG{page_index:02d}"
+            filename = f"page_{page_no:02d}_image_{page_index:02d}.{ext}"
+
+            images.append({
+                "id": image_id,
+                "page": page_no,
+                "index": page_index,
+                "filename": filename,
+                "ext": ext,
+                "width": width,
+                "height": height,
+                "bytes": blob,
+            })
+
+    return images
+
+
+def collect_image_pages(structured: dict):
+    """Return source pages that contain questions marked image_required."""
+    pages = set()
+    for sec in structured.get("sections", []):
+        for q in sec.get("questions", []):
+            if q.get("image_required") and q.get("source_page"):
+                try:
+                    pages.add(int(q.get("source_page")))
+                except Exception:
+                    pass
+    return sorted(pages)
+
 
 
 def extract_docx_text(data: bytes) -> str:
@@ -275,55 +404,96 @@ def image_inventory_text(images) -> str:
 
 
 def build_prompt(form_text: str) -> str:
-    """Minimal prompt: Gemini only parses questions and 3 output types."""
+    """Compact prompt for speed and low token usage."""
     return f"""
-Convert this Google Forms PDF text to JSON for Microsoft Forms Quick Import.
+Parse this Google Forms PDF text into JSON for Microsoft Forms Quick Import.
 
-USE ONLY 3 TYPES:
-- choice
-- multiple_answers
-- open_text
+ONLY 3 TYPES:
+c = choice
+m = multiple_answers
+t = open_text
 
-MAPPING:
-- Multiple choice / Dropdown / Linear scale -> choice
-- Grid / Likert / Matching -> split each row into separate choice questions
-- Checkboxes / Checkbox grid -> multiple_answers; split checkbox-grid rows
-- Short answer / Paragraph / unsafe-to-convert -> open_text
+MAP:
+- Multiple choice / Dropdown / Linear scale -> c
+- Grid / Likert / Matching -> split each row -> c
+- Checkboxes / Checkbox grid -> m; split checkbox-grid rows
+- Short answer / Paragraph / unsafe -> t
 
 RULES:
-- Preserve original title, sections, question order, wording and options.
-- If visible selectable options exist, preserve them; do not change to open_text just because PDF formatting is imperfect.
-- Never invent missing content or answers.
-- For image-dependent questions, set image_required=true and source_page from PAGE markers when clear.
-- No answer processing. Python handles quiz answers separately.
+- Preserve original wording, order and options.
+- If visible options exist, keep them.
+- Never invent missing text or answers.
+- For image-dependent questions: img=true and p=source PAGE number when clear.
 - JSON only.
 
 SCHEMA:
 {{
   "title": "",
-  "description": "",
   "sections": [
     {{
       "title": "",
-      "description": "",
       "questions": [
         {{
-          "number": "",
-          "question": "",
-          "output_type": "choice|multiple_answers|open_text",
-          "options": [],
-          "image_required": false,
-          "source_page": null,
-          "review_required": false
+          "n": "",
+          "q": "",
+          "t": "c|m|t",
+          "o": [],
+          "img": false,
+          "p": null,
+          "r": false
         }}
       ]
     }}
   ]
 }}
 
-FORM TEXT:
+FORM:
 {form_text}
 """
+
+def expand_compact_structure(raw_structured: dict) -> dict:
+    """Convert compact Gemini JSON into the app's normal internal structure."""
+    result = {
+        "title": raw_structured.get("title", ""),
+        "description": raw_structured.get("description", ""),
+        "sections": [],
+    }
+
+    for sec in raw_structured.get("sections", []):
+        new_sec = {
+            "title": sec.get("title", ""),
+            "description": sec.get("description", ""),
+            "questions": [],
+        }
+
+        for q in sec.get("questions", []):
+            t = str(q.get("t", "t")).strip().lower()
+            mapped = {
+                "c": "choice",
+                "m": "multiple_answers",
+                "t": "open_text",
+                "choice": "choice",
+                "multiple_answers": "multiple_answers",
+                "open_text": "open_text",
+            }.get(t, "open_text")
+
+            new_sec["questions"].append({
+                "number": str(q.get("n", "") or ""),
+                "question": str(q.get("q", "") or ""),
+                "output_type": mapped,
+                "options": list(q.get("o", []) or []),
+                "answer": [],
+                "required": False,
+                "image_required": bool(q.get("img", False)),
+                "source_page": q.get("p"),
+                "image_refs": [],
+                "review_required": bool(q.get("r", False)),
+            })
+
+        result["sections"].append(new_sec)
+
+    return result
+
 
 def normalize_for_quick_import(structured: dict):
     """Enforce only 3 output types: choice, multiple_answers, open_text."""
@@ -642,12 +812,12 @@ def safe_stem(name: str) -> str:
 
 
 def safe_docx_filename(name: str) -> str:
-    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_8.docx"
+    return f"{safe_stem(name)}_Microsoft_Forms_Import_V6_9.docx"
 
 
 def make_mapping_text(mapping_rows, images):
     lines = [
-        "Coach Winnie – Forms Converter V6.8",
+        "Coach Winnie – Forms Converter V6.9",
         "Image Mapping Report",
         "",
         "Important: Quick Import Word intentionally contains NO images, following Microsoft Forms import guidance.",
@@ -721,11 +891,10 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         with st.status("正在读取并转换表单…", expanded=True) as status:
             st.write("读取 PDF 文字")
             pdf_bytes = pdf_file.getvalue()
-            form_text = extract_pdf_text(pdf_bytes)
+            raw_form_text = extract_pdf_text(pdf_bytes)
 
-            st.write("提取 PDF 图片")
-            images = extract_pdf_images(pdf_bytes)
-            st.write(f"检测到 {len(images)} 个可提取候选图片")
+            st.write("清理 Google Forms UI 文字")
+            form_text = clean_form_text_for_gemini(raw_form_text)
 
             st.write("读取答案文件" if answer_file else "没有答案文件，将不会推测答案")
             answer_text = extract_answer_text(answer_file)
@@ -734,16 +903,25 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
             quiz_mode = output_mode.startswith("Quiz")
             prompt = build_prompt(form_text)
 
-            st.write("Low Token Mode：Gemini 只识别题目结构与 3 种题型")
+            st.write("Fast + Low Token：Gemini 只识别题目结构与 3 种题型")
             response, model_used = call_gemini_with_retry(
                 api_key, prompt, status
             )
             st.write(f"Gemini 连接成功：{model_used}")
             raw = response.text or ""
-            structured = json.loads(clean_json_text(raw))
+            compact_structured = json.loads(clean_json_text(raw))
+            structured = expand_compact_structure(compact_structured)
             structured = normalize_for_quick_import(structured)
 
-            # Python handles images and quiz answers locally.
+            # Lazy image extraction: only scan pages actually marked as image questions.
+            image_pages = collect_image_pages(structured)
+            if image_pages:
+                st.write(f"只提取图片题所在页面：{', '.join(map(str, image_pages))}")
+                images = extract_pdf_images_for_pages(pdf_bytes, image_pages)
+            else:
+                images = []
+                st.write("未检测到图片题，跳过图片提取")
+
             structured = attach_page_image_candidates(structured, images)
             matched_answers = 0
             if quiz_mode and answer_map:
@@ -773,11 +951,11 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         c3.metric("Open text", report["output_types"].get("open_text", 0))
 
         c4, c5, c6 = st.columns(3)
-        c4.metric("PDF 图片", report["extracted_images"])
+        c4.metric("已提取图片", report["extracted_images"])
         c5.metric("图片题", report["image_questions"])
         c6.metric("Quick Import 内图片", report["embedded_images"])
 
-        st.subheader("⚡ Low Token Mode")
+        st.subheader("⚡ Fast + Low Token Mode")
         t1, t2, t3 = st.columns(3)
         t1.metric("Input Tokens", usage_tokens["input"] if usage_tokens["input"] is not None else "—")
         t2.metric("Output Tokens", usage_tokens["output"] if usage_tokens["output"] is not None else "—")
@@ -826,7 +1004,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         st.download_button(
             "📦 Download Word + Extracted Images ZIP",
             data=bundle_bytes,
-            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_8_Bundle.zip",
+            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V6_9_Bundle.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -870,8 +1048,8 @@ st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
-<strong>V6.8 Low Token Mode：</strong>
-Gemini 只负责题目解析与 3 种题型分类；答案配对、A/B/C/D、图片 ZIP 与 Word 排版由 Python 完成，以减少 Tokens。<br>Quiz 模式若上传答案文件，选择题答案仍以英文选项字母输出，例如 <strong>Answer: A</strong>；没有答案的题不会推测。<br>
+<strong>V6.9 Fast + Low Token Mode：</strong>
+Python 会先清理 PDF UI 文字；Gemini 使用 Compact JSON，只负责题目解析与 3 种题型分类；图片仅在检测到图片题时才按相关页面 Lazy Extraction。<br>Quiz 模式若上传答案文件，选择题答案仍以英文选项字母输出，例如 <strong>Answer: A</strong>；没有答案的题不会推测。<br>
 <strong>重要限制：</strong>
 Microsoft Forms Quick Import 不保证把 Word 内图片自动转换成题目图片；若图片没有带入，请使用 ZIP 内原图手动补回。<br>
 <strong>Privacy：</strong>
