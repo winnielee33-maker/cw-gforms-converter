@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 
 APP_NAME = "Coach Winnie – Forms Converter"
-APP_VERSION = "V7.0 Smart Model Selection"
+APP_VERSION = "V7.1 Teacher-Friendly Error Handling"
 DEFAULT_MODEL_MODE = os.getenv("GEMINI_MODEL_MODE", "Auto")
 AUTO_MODEL = os.getenv("GEMINI_AUTO_MODEL", "gemini-flash-latest")
 STABLE_MODEL = os.getenv("GEMINI_STABLE_MODEL", "gemini-3.6-flash")
@@ -249,7 +249,7 @@ def build_prompt(form_text: str, answer_text: str, quiz_mode: bool, images) -> s
     )
 
     return f"""
-You are the conversion engine for "Coach Winnie – Forms Converter V7.0".
+You are the conversion engine for "Coach Winnie – Forms Converter V7.1".
 
 GOAL
 Convert a Google Forms print/PDF into a structure optimized for Microsoft Forms Quick Import Word (.docx).
@@ -420,26 +420,69 @@ def resolve_model_candidates(model_mode: str, custom_model_name: str = ""):
 
 
 def classify_gemini_error(exc: Exception) -> str:
+    """
+    Classify Gemini API errors into teacher-friendly categories.
+    SERVICE_DISABLED and permission errors must stop immediately;
+    they should NOT trigger retry/fallback.
+    """
     msg = str(exc).lower()
 
-    # Model endpoint/access changed: skip this model and try the next supported fallback.
+    # API not enabled for the project.
+    if (
+        "service_disabled" in msg
+        or "gemini api has not been used in project" in msg
+        or "generativelanguage.googleapis.com" in msg and "disabled" in msg
+    ):
+        return "service_disabled"
+
+    # Invalid API key / auth problem.
+    if (
+        "api_key_invalid" in msg
+        or "api key not valid" in msg
+        or "invalid api key" in msg
+        or "unauthenticated" in msg
+        or "401" in msg
+    ):
+        return "invalid_key"
+
+    # Permission denied at project/account level.
+    if (
+        "permission_denied" in msg
+        or "the caller does not have permission" in msg
+        or "403" in msg
+    ):
+        return "permission_denied"
+
+    # Model endpoint/access changed or model unavailable.
     model_unavailable_signals = [
-        "404", "not_found", "not found", "no longer available",
-        "model is not available", "model not available"
+        "404",
+        "not_found",
+        "not found",
+        "no longer available",
+        "model is not available",
+        "model not available",
+        "unsupported model",
     ]
     if any(s in msg for s in model_unavailable_signals):
         return "model_unavailable"
 
-    # Temporary capacity/rate issues: retry same model, then fall back.
+    # Temporary capacity / quota conditions.
     temporary_signals = [
-        "503", "unavailable", "high demand", "temporarily unavailable",
-        "service unavailable", "resource exhausted", "429",
-        "rate limit", "quota exceeded"
+        "503",
+        "unavailable",
+        "high demand",
+        "temporarily unavailable",
+        "service unavailable",
+        "resource exhausted",
+        "429",
+        "rate limit",
+        "quota exceeded",
     ]
     if any(s in msg for s in temporary_signals):
         return "temporary"
 
     return "fatal"
+
 
 
 def call_gemini_with_retry(
@@ -450,13 +493,11 @@ def call_gemini_with_retry(
     status_box=None,
 ):
     """
-    Smart model selection:
-    - Auto -> gemini-flash-latest -> Stable -> Lite
-    - Stable -> fixed stable model
-    - Lite -> fixed low-cost model
-    - Custom -> user-supplied model name
-    - no models.list() scan
-    - one retry for temporary 429/503 per selected model
+    Smart model selection with safe retry behavior:
+    - Auto -> latest -> stable -> lite
+    - 429 / 503: retry once, then fallback
+    - model unavailable: fallback to next candidate
+    - SERVICE_DISABLED / 403 permission / invalid key: stop immediately
     """
     client = genai.Client(api_key=api_key)
     candidates = resolve_model_candidates(model_mode, custom_model_name)
@@ -488,23 +529,29 @@ def call_gemini_with_retry(
                 last_error = exc
                 error_kind = classify_gemini_error(exc)
 
-                if error_kind == "fatal":
+                # These are NOT model problems and must not be retried/fallback.
+                if error_kind in (
+                    "service_disabled",
+                    "permission_denied",
+                    "invalid_key",
+                    "fatal",
+                ):
                     raise
 
-                # 404 / retired / unavailable endpoint: move to next candidate immediately.
+                # Model unavailable: move to next candidate immediately.
                 if error_kind == "model_unavailable":
                     if status_box and len(candidates) > 1:
                         status_box.write(f"{model_name} 不可用，正在尝试备用模型…")
                     break
 
-                # Temporary 429 / 503: retry once on same model.
+                # Temporary 429 / 503: retry once on the same model.
                 if error_kind == "temporary" and attempt == 1:
                     if status_box:
-                        status_box.write("服务暂时繁忙，3 秒后再试一次…")
+                        status_box.write("Gemini 服务暂时繁忙，3 秒后自动重试一次…")
                     time.sleep(3)
                     continue
 
-                # Temporary failure after retry: move to next candidate when available.
+                # After retry failure, move to next candidate.
                 break
 
     raise RuntimeError(
@@ -686,12 +733,12 @@ def safe_stem(name: str) -> str:
 
 
 def safe_docx_filename(name: str) -> str:
-    return f"{safe_stem(name)}_Microsoft_Forms_Import_V7_0.docx"
+    return f"{safe_stem(name)}_Microsoft_Forms_Import_V7_1.docx"
 
 
 def make_mapping_text(mapping_rows, images):
     lines = [
-        "Coach Winnie – Forms Converter V7.0",
+        "Coach Winnie – Forms Converter V7.1",
         "Image Mapping Report",
         "",
         "Important: Quick Import Word intentionally contains NO images, following Microsoft Forms import guidance.",
@@ -749,6 +796,61 @@ def build_conversion_report(structured: dict, images, embedded_ids):
         "extracted_images": len(images),
         "embedded_images": len(embedded_ids),
     }
+
+
+def show_teacher_friendly_error(exc: Exception):
+    """Display short, actionable errors instead of raw Google exception payloads."""
+    kind = classify_gemini_error(exc)
+
+    if kind == "service_disabled":
+        st.error(
+            "⚠️ Gemini API 尚未启用\n\n"
+            "这个 API Key 所属的 Google Cloud Project 尚未启用 Gemini API / Generative Language API。\n\n"
+            "请先在对应 Project 启用 Gemini API，等待几分钟后再重新转换。\n\n"
+            "更换 Gemini Model 无法解决此问题。"
+        )
+        st.info(
+            "建议：如果这是老师第一次建立 API Key，也可以直接到 Google AI Studio 建立新的 API Key，"
+            "并确认该 Key 所属 Project 已启用 Gemini API。"
+        )
+        return
+
+    if kind == "permission_denied":
+        st.error(
+            "⚠️ 这个 API Key / Project 没有 Gemini 内容生成权限\n\n"
+            "请检查该 API Key 所属的 Google Project 是否允许使用 Gemini API。"
+        )
+        st.info(
+            "建议：可尝试在 Google AI Studio 建立一个新的 API Key，并使用新的 Project 测试。"
+        )
+        return
+
+    if kind == "invalid_key":
+        st.error(
+            "⚠️ Gemini API Key 无效\n\n"
+            "请检查 API Key 是否完整、是否复制正确，或重新在 Google AI Studio 建立新的 API Key。"
+        )
+        return
+
+    if kind == "model_unavailable":
+        st.error(
+            "⚠️ 当前选择的 Gemini Model 不可用\n\n"
+            "请改用 Auto、Stable、Lite，或输入另一个可用的 Custom Model Name。"
+        )
+        return
+
+    if kind == "temporary":
+        st.error(
+            "⚠️ Gemini 服务暂时繁忙或达到使用限制\n\n"
+            "Mini App 已自动重试。请稍后再试，或切换到另一个 Model。"
+        )
+        return
+
+    st.error(
+        "转换失败。请重新检查 API Key、Model 设定与上传文件后再试。"
+    )
+
+
 
 
 if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_container_width=True):
@@ -851,7 +953,7 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         st.download_button(
             "📦 Download Word + Extracted Images ZIP",
             data=bundle_bytes,
-            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V7_0_Bundle.zip",
+            file_name=f"{safe_stem(pdf_file.name)}_Microsoft_Forms_V7_1_Bundle.zip",
             mime="application/zip",
             use_container_width=True,
         )
@@ -866,36 +968,19 @@ if st.button("✨ Convert to Microsoft Forms Word", type="primary", use_containe
         )
 
     except json.JSONDecodeError:
-        st.error("Gemini 输出无法解析为结构化数据，请重试。若 PDF 很复杂，可分成较小部分转换。")
+        st.error(
+            "Gemini 输出无法解析为结构化数据。请再试一次；"
+            "如果 PDF 很复杂，可尝试分成较小部分转换。"
+        )
     except Exception as e:
-        msg = str(e)
-        if "API_KEY_INVALID" in msg or "API key not valid" in msg or "INVALID_ARGUMENT" in msg:
-            st.error("Gemini API Key 无效或请求设置不正确。请到 Google AI Studio 检查 API Key 后再试。")
-        elif "404" in msg or "NOT_FOUND" in msg or "no longer available" in msg:
-            st.error(
-                "当前 Gemini 模型对此 API Key / project 不可用。"
-                "请检查 Google AI Studio 中该 project 可使用的模型。"
-            )
-        elif (
-            "RESOURCE_EXHAUSTED" in msg
-            or "429" in msg
-            or "503" in msg
-            or "UNAVAILABLE" in msg
-            or "服务目前繁忙" in msg
-        ):
-            st.error(
-                "Gemini 服务目前繁忙或暂时达到 Free API 使用限制。"
-                "Mini App 已自动重试一次，请稍后再按 Convert。"
-            )
-        else:
-            st.error(f"转换失败：{e}")
+        show_teacher_friendly_error(e)
 
 st.divider()
 st.markdown("""
 <div class="small">
 <strong>Microsoft Forms 导入：</strong>
 Microsoft Forms → Quick Import → Upload from this device → 选择生成的 Word → Form / Quiz。<br>
-<strong>V7.0 Smart Model Selection：</strong>
+<strong>V7.1 Teacher-Friendly Error Handling：</strong>
 Quick Import Word 只保留垂直排列的题目与选项，不嵌入图片；图片会另外保存到 ZIP 与 image_mapping.txt。<br>Quiz 模式若上传答案文件，选择题答案以英文选项字母输出，例如 <strong>Answer: A</strong>；没有答案的题不会推测。<br>模型选择：Auto 使用 <strong>gemini-flash-latest</strong>；也可选择 Stable、Lite 或 Custom。<br>
 <strong>重要限制：</strong>
 Microsoft Forms Quick Import 不保证把 Word 内图片自动转换成题目图片；若图片没有带入，请使用 ZIP 内原图手动补回。<br>
